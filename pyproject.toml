@@ -1,0 +1,21 @@
+[project]
+name = "oracle-agent"
+version = "0.1.0"
+description = "Prediction market resolution agent"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "pydantic-ai",
+    "uvicorn",
+]
+
+[dependency-groups]
+dev = [
+    "httpx",
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra -v"
+testpaths = ["tests"]
+pythonpath = ["src"]
