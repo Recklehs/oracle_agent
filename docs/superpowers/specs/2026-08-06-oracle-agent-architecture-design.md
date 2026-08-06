@@ -41,6 +41,31 @@ MVP의 최우선 기준은 자동 처리율이 아니라 잘못된 자동 판정
 
 Pydantic AI는 LLM 실행, 도구 호출, 구조화된 조사 결과 생성을 담당한다. HTTP 요청 처리, 작업 저장, 자동 판정 허용 정책, Webhook 전달은 애플리케이션 코드가 담당한다.
 
+### Pydantic AI 기능 우선 원칙
+
+Pydantic AI가 책임에 직접 맞는 공개 기능을 제공하면 자체 구현보다 해당 기능을 우선한다. 내부 API나 목적이 다른 기능을 억지로 재사용하지 않는다.
+
+| 책임 | 적용 방식 |
+| --- | --- |
+| 외부 HTTP 요청 접수 | Pydantic AI 제공 기능이 아니므로 FastAPI로 구현한다. |
+| 작업과 판정 결과 저장 | Pydantic AI의 SQLite 작업 저장 기능은 없으므로 표준 `sqlite3`로 구현한다. |
+| 구조화된 조사 결과 | Pydantic AI `output_type`과 Pydantic 모델을 사용한다. |
+| Agent 출력 검증과 자기 수정 | `output_validator`, `ModelRetry`, Pydantic 검증을 우선 사용한다. |
+| 자동 정산 허용 여부 | 금전 정산 규칙은 모델 출력 검증과 분리하여 `resolution.py`의 결정론적 코드로 구현한다. |
+| 웹 검색과 페이지 조회 | `pydantic_ai.capabilities.WebSearch`와 `WebFetch`를 우선 사용한다. 선택한 모델이 native 기능을 지원하지 않으면 공식 local fallback을 사용한다. |
+| Agent 의존성 전달 | `deps_type`과 `RunContext`를 사용한다. |
+| Agent 동시 실행 제한 | `Agent(max_concurrency=...)` 또는 `ConcurrencyLimit`을 사용한다. |
+| 모델 요청·도구 호출·비용 제한 | `UsageLimits`를 사용한다. |
+| 모델 제공자 HTTP 재시도 | 제공자가 custom HTTP client를 지원하면 `pydantic_ai.retries.AsyncTenacityTransport`를 사용한다. |
+| Agent lifecycle 관찰 | 실제 로깅이나 측정 요구가 생기면 `pydantic_ai.capabilities.Hooks`를 사용한다. |
+| Webhook 전송 | Pydantic AI 제공 기능이 아니므로 HTTP client로 직접 구현한다. |
+| 단위 테스트용 모델 대체 | `TestModel`, `FunctionModel`, `Agent.override`, `ALLOW_MODEL_REQUESTS=False`를 사용한다. |
+| Agent 품질 평가 | 실제 시장 사례가 쌓이면 Pydantic Evals를 사용한다. |
+
+Pydantic AI의 durable execution은 Temporal, DBOS, Prefect, Restate 같은 별도 실행 시스템과의 통합이다. 현재 합의한 SQLite와 단일 FastAPI 프로세스 구조를 대체하기에는 운영 요소가 늘어나므로 MVP에서는 사용하지 않는다. 별도 실행 인프라가 실제로 필요해질 때 다시 평가한다.
+
+Deferred tools는 사람 승인을 받은 뒤 같은 Agent 대화를 이어가는 기능이다. MVP의 `ESCALATED`는 조사 작업을 종료하고 외부 운영자에게 판정을 넘기므로 사용하지 않는다. 사람 검토 결과를 Agent 실행에 다시 주입하는 요구가 생기면 도입한다.
+
 ## 4. 패키지 구조
 
 하나의 Python 패키지 안에서 파일 단위로 책임을 나눈다. 계층별 하위 패키지는 만들지 않는다. Agent 관련 코드만 응집도가 높고 함께 변경되므로 별도 디렉터리에 둔다.
@@ -106,7 +131,7 @@ queued → running → resolved | escalated | failed
 - 새 작업이 저장되면 루프를 즉시 깨운다.
 - 서버 시작 시 남아 있는 `queued` 작업을 조회한다.
 - 서버 시작 시 남아 있는 모든 `running` 작업은 이전 프로세스에서 중단된 것으로 보고 `queued`로 되돌린다.
-- `asyncio.Semaphore`로 동시에 실행할 Agent 작업 수를 제한한다.
+- Pydantic AI의 `Agent(max_concurrency=...)`로 동시에 실행할 Agent 작업 수를 제한한다.
 - MVP는 단일 Uvicorn 프로세스로 실행한다.
 - 서버가 꺼져 있는 동안에는 처리하지 않지만 재시작하면 이어서 처리한다.
 
@@ -179,7 +204,7 @@ Webhook 이벤트 유형은 `resolution.completed`와 `resolution.escalated`를 
 - Webhook 전송과 중복 방지
 - 서버 시작 시 미완료 작업 복구
 
-통합 테스트에서는 pytest의 `tmp_path`로 테스트별 임시 SQLite를 사용한다. LLM, 외부 검색, Webhook 전송만 `monkeypatch`로 대체하여 네트워크와 비용 없이 전체 내부 흐름을 검증한다.
+통합 테스트에서는 pytest의 `tmp_path`로 테스트별 임시 SQLite를 사용한다. Agent 모델은 Pydantic AI의 `TestModel` 또는 `FunctionModel`과 `Agent.override`로 대체하고, `ALLOW_MODEL_REQUESTS=False`로 실수로 실제 모델을 호출하지 못하게 한다. 외부 검색과 Webhook 전송만 `monkeypatch`로 대체하여 네트워크와 비용 없이 전체 내부 흐름을 검증한다.
 
 실제 LLM과 인터넷을 호출하는 테스트는 기본 `pytest` 실행에 포함하지 않는다. 실제 시장 사례가 축적된 뒤 별도 live 테스트나 Pydantic Evals 데이터셋으로 추가한다.
 
