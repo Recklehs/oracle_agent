@@ -37,11 +37,6 @@ from oracle_agent.models import (
 MAX_OUTPUT_RETRIES = 3
 RETRYABLE_HTTP_STATUSES = {429, 502, 503, 504}
 logger = logging.getLogger(__name__)
-USAGE_LIMITS = UsageLimits(
-    request_limit=12,
-    tool_calls_limit=12,
-    output_tokens_limit=16_000,
-)
 
 INVESTIGATION_INSTRUCTIONS = """
 당신은 prediction market의 YES/NO 종료 결과를 조사하는 독립적인 Oracle Agent다.
@@ -135,19 +130,26 @@ class _InvestigationTrace:
     source_urls: set[tuple[str, str, str, str]]
     fetched_urls: set[tuple[str, str, str, str]]
     failed_fetch_urls: set[tuple[str, str, str, str]]
+    provenance_complete: bool
 
 
 def _extract_investigation_trace(messages: list[ModelMessage]) -> _InvestigationTrace:
     search_calls: set[str] = set()
     fetch_calls: dict[str, tuple[str, str, str, str]] = {}
-    trace = _InvestigationTrace(set(), set(), set(), set())
+    trace = _InvestigationTrace(set(), set(), set(), set(), True)
     for message in messages:
         for part in message.parts:
             if isinstance(part, NativeToolCallPart) and part.tool_name == "web_search":
                 search_calls.add(part.tool_call_id)
-                query = part.args_as_dict().get("query")
+                args = part.args_as_dict()
+                query = args.get("query")
                 if isinstance(query, str):
                     trace.queries.add(query.casefold())
+                queries = args.get("queries")
+                if isinstance(queries, list):
+                    trace.queries.update(
+                        item.casefold() for item in queries if isinstance(item, str)
+                    )
             elif (
                 isinstance(part, NativeToolReturnPart)
                 and part.tool_name == "web_search"
@@ -156,11 +158,17 @@ def _extract_investigation_trace(messages: list[ModelMessage]) -> _Investigation
                 content = part.content if isinstance(part.content, dict) else {}
                 for source in content.get("sources", []):
                     if isinstance(source, dict) and isinstance(source.get("url"), str):
-                        trace.source_urls.add(_normalize_url(source["url"]))
+                        try:
+                            trace.source_urls.add(_normalize_url(source["url"]))
+                        except ValueError:
+                            trace.provenance_complete = False
             elif isinstance(part, ToolCallPart) and part.tool_name == "web_fetch":
                 url = part.args_as_dict().get("url")
                 if isinstance(url, str):
-                    fetch_calls[part.tool_call_id] = _normalize_url(url)
+                    try:
+                        fetch_calls[part.tool_call_id] = _normalize_url(url)
+                    except ValueError:
+                        trace.provenance_complete = False
             elif isinstance(part, ToolReturnPart) and part.tool_name == "web_fetch":
                 if url := fetch_calls.get(part.tool_call_id):
                     if isinstance(part.content, dict) and part.content.get("error"):
@@ -211,46 +219,9 @@ def finalize_investigation(
             review.fitness,
         )
 
-    categories = {query.category for query in search_queries}
-    queries = [query.query.casefold() for query in search_queries]
-    if categories != set(SearchCategory) or len(queries) != len(set(queries)):
-        return _retry_or_escalate(
-            ctx,
-            summary,
-            evidence,
-            "필수 검색 범주마다 서로 다른 검색어가 필요합니다.",
-        )
-
     official_urls = {_normalize_url(url) for url in ctx.deps.official_sources}
     candidate_urls = {_normalize_url(candidate.url) for candidate in search_candidates}
     search_candidate_urls = candidate_urls - official_urls
-    if len(search_candidate_urls) > 5:
-        return _retry_or_escalate(
-            ctx,
-            summary,
-            evidence,
-            "검색으로 발견한 후보 원문은 최대 5개만 조회할 수 있습니다.",
-        )
-
-    if decision in {"YES", "NO"} and (
-        not all(
-            (
-                self_review.criteria_clear,
-                self_review.result_period_complete,
-                self_review.findings_match_sources,
-                self_review.duplicate_publishers_checked,
-                self_review.contradiction_search_complete,
-            )
-        )
-        or self_review.missing_research
-    ):
-        return _retry_or_escalate(
-            ctx,
-            summary,
-            evidence,
-            "YES/NO 자동 판정 전 자기검토를 모두 완료해야 합니다.",
-        )
-
     normalized_evidence_urls = [_normalize_url(item["url"]) for item in evidence]
     normalized_review_urls = [_normalize_url(review.url) for review in evidence_reviews]
     if (
@@ -267,6 +238,11 @@ def finalize_investigation(
     fitness_by_url = {
         _normalize_url(review.url): review.fitness for review in evidence_reviews
     }
+    categories = {query.category for query in search_queries}
+    queries = [query.query.casefold() for query in search_queries]
+    search_plan_valid = categories == set(SearchCategory) and len(queries) == len(
+        set(queries)
+    )
 
     trace = _extract_investigation_trace(ctx.messages)
     logger.info(
@@ -275,12 +251,17 @@ def finalize_investigation(
         len(trace.fetched_urls),
         len(trace.failed_fetch_urls),
     )
-    if not set(queries) <= trace.queries:
+    if not trace.provenance_complete:
+        reason = (
+            "조사 도구 실행 기록에 정규화할 수 없는 URL이 있습니다."
+            if search_plan_valid
+            else "필수 검색 범주마다 서로 다른 검색어가 필요합니다."
+        )
         return _retry_or_escalate(
             ctx,
             summary,
             evidence,
-            "제출한 검색어를 실제로 모두 실행해야 합니다.",
+            reason,
         )
 
     if not candidate_urls <= trace.source_urls | official_urls:
@@ -306,25 +287,95 @@ def finalize_investigation(
         )
 
     evidence_urls = set(normalized_evidence_urls)
-    automatic_evidence_urls = {
-        _normalize_url(item["url"])
-        for item in evidence
-        if item["supports"] == decision
-        and fitness_by_url[_normalize_url(item["url"])] is EvidenceFitness.FINAL
-    }
-    if automatic_evidence_urls & trace.failed_fetch_urls:
+    effective_failed_urls = trace.failed_fetch_urls - trace.fetched_urls
+    if not official_urls <= trace.fetched_urls | effective_failed_urls:
         return _retry_or_escalate(
             ctx,
             summary,
             evidence,
-            "원문 조회에 실패한 URL은 결론 근거로 사용할 수 없습니다.",
+            "제출한 검색어와 모든 시장 지정 공식 URL 원문을 실제로 조회해야 합니다.",
         )
-    if not evidence_urls <= candidate_urls or not automatic_evidence_urls <= trace.fetched_urls:
+    if not evidence_urls <= candidate_urls or not evidence_urls <= (
+        trace.fetched_urls | effective_failed_urls
+    ):
         return _retry_or_escalate(
             ctx,
             summary,
             evidence,
-            "모든 증거는 후보 원문을 성공적으로 조회해야 합니다.",
+            "모든 증거는 후보이며 성공 또는 실패 원문 조회 기록과 일치해야 합니다.",
+        )
+
+    invalid_failed_evidence = [
+        item
+        for item in evidence
+        if _normalize_url(item["url"]) in effective_failed_urls
+        and (
+            item["supports"] != "INCONCLUSIVE"
+            or fitness_by_url[_normalize_url(item["url"])] is not EvidenceFitness.INCONCLUSIVE
+        )
+    ]
+    if invalid_failed_evidence:
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "원문 조회에 실패한 URL은 INCONCLUSIVE 증거로만 기록할 수 있습니다.",
+        )
+
+    authoritative_directions = {
+        item["supports"]
+        for item in evidence
+        if item["authority"] in {"official", "high_trust"}
+        and item["supports"] != "INCONCLUSIVE"
+        and _normalize_url(item["url"]) in trace.fetched_urls
+    }
+    if authoritative_directions == {"YES", "NO"}:
+        return InvestigationResult(
+            prediction_id=ctx.deps.prediction_id,
+            decision="ESCALATED",
+            summary=summary,
+            evidence=evidence,
+            escalation_reason="권위 있는 출처가 YES와 NO로 충돌합니다.",
+        )
+
+    if not search_plan_valid:
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "필수 검색 범주마다 서로 다른 검색어가 필요합니다.",
+        )
+    if not set(queries) <= trace.queries:
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "제출한 검색어를 실제로 모두 실행해야 합니다.",
+        )
+    if len(search_candidate_urls) > 5:
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "검색으로 발견한 후보 원문은 최대 5개만 조회할 수 있습니다.",
+        )
+    if decision in {"YES", "NO"} and (
+        not all(
+            (
+                self_review.criteria_clear,
+                self_review.result_period_complete,
+                self_review.findings_match_sources,
+                self_review.duplicate_publishers_checked,
+                self_review.contradiction_search_complete,
+            )
+        )
+        or self_review.missing_research
+    ):
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "YES/NO 자동 판정 전 자기검토를 모두 완료해야 합니다.",
         )
 
     observed_urls = {_normalize_url(item["url"]) for item in evidence}
@@ -341,21 +392,6 @@ def finalize_investigation(
             f"확인하지 않은 공식 URL: {', '.join(missing_official_urls)}",
         )
 
-    authoritative_directions = {
-        item["supports"]
-        for item in evidence
-        if item["authority"] in {"official", "high_trust"}
-        and item["supports"] != "INCONCLUSIVE"
-    }
-    if authoritative_directions == {"YES", "NO"}:
-        return InvestigationResult(
-            prediction_id=ctx.deps.prediction_id,
-            decision="ESCALATED",
-            summary=summary,
-            evidence=evidence,
-            escalation_reason="권위 있는 출처가 YES와 NO로 충돌합니다.",
-        )
-
     independent_publishers: set[str] = set()
     if decision in {"YES", "NO"}:
         matching_evidence = [
@@ -363,6 +399,7 @@ def finalize_investigation(
             for item in evidence
             if item["supports"] == decision
             and fitness_by_url[_normalize_url(item["url"])] is EvidenceFitness.FINAL
+            and _normalize_url(item["url"]) in trace.fetched_urls
         ]
         if any(item["authority"] == "official" for item in matching_evidence):
             return InvestigationResult(
@@ -531,7 +568,14 @@ async def resolve(investigation: InvestigationInput) -> InvestigationResult:
     result = await _agent.run(
         "공식 출처부터 조사를 수행하고 최종 결과를 제출하세요.",
         deps=investigation,
-        usage_limits=USAGE_LIMITS,
+        usage_limits=UsageLimits(
+            request_limit=12,
+            tool_calls_limit=max(
+                12,
+                9 + len({_normalize_url(url) for url in investigation.official_sources}),
+            ),
+            output_tokens_limit=16_000,
+        ),
     )
     usage = result.usage
     logger.info(

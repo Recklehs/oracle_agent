@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import httpx
@@ -590,8 +591,98 @@ class Test사람검토이관:
         assert "충돌" in (result.escalation_reason or "")
         assert calls == 1
 
+    def test_확인된_충돌이면_불완전한_검색계획보다_먼저_즉시_이관한다(self):
+        conflict = _충돌_증거_출력()
+        recovered = _고신뢰_증거_출력("YES", ["기관 A", "기관 B"])
+        conflict["search_candidates"] += recovered["search_candidates"]
+        conflict["self_review"]["contradiction_search_complete"] = False
+        recovered["search_candidates"] = conflict["search_candidates"]
+
+        result, _, calls = _run_outputs(
+            _입력(official_sources=[]),
+            [conflict, recovered],
+            message_history=_출력_조사_기록(conflict),
+        )
+
+        assert result.decision == "ESCALATED"
+        assert "충돌" in (result.escalation_reason or "")
+        assert calls == 1
+
+    def test_원문조회로_확인되지_않은_충돌이면_보완조사한다(self):
+        conflict = _충돌_증거_출력()
+        recovered = _고신뢰_증거_출력("YES", ["기관 A", "기관 B"])
+        recovered["search_candidates"].append(conflict["search_candidates"][0])
+        histories = [
+            _조사_기록(
+                query=_검색_계획()[0]["query"],
+                source_url=conflict["search_candidates"][0]["url"],
+            ),
+            _조사_기록(
+                query=_검색_계획()[1]["query"],
+                source_url=conflict["search_candidates"][1]["url"],
+                fetch=False,
+            ),
+            _조사_기록(
+                query=_검색_계획()[2]["query"],
+                source_url=recovered["search_candidates"][0]["url"],
+            ),
+            _조사_기록(
+                query=_검색_계획()[3]["query"],
+                source_url=recovered["search_candidates"][1]["url"],
+            ),
+        ]
+
+        result, _, calls = _run_outputs(
+            _입력(official_sources=[]),
+            [conflict, recovered],
+            message_history=[message for history in histories for message in history],
+        )
+
+        assert result.decision == "YES"
+        assert calls == 2
+
 
 class Test조사실행기록:
+    def test_시장_지정_공식_url을_실제로_조회하지_않으면_이관한다(self):
+        confirmed_url = "https://example.com/official"
+        unobserved_url = "https://example.com/unobserved"
+        output = _출력(
+            "YES",
+            [
+                _증거(
+                    "YES",
+                    url=confirmed_url,
+                    authority="official",
+                    publisher="확정한 공식 기관",
+                ),
+                _증거(
+                    "INCONCLUSIVE",
+                    url=unobserved_url,
+                    authority="official",
+                    publisher="조회하지 않은 공식 기관",
+                ),
+            ],
+        )
+        output["evidence_reviews"][1]["fitness"] = "INCONCLUSIVE"
+        history = [
+            message
+            for query in _검색_계획()
+            for message in _조사_기록(
+                query=query["query"],
+                source_url=confirmed_url,
+            )
+        ]
+
+        result, _, calls = _run_outputs(
+            _입력(official_sources=[confirmed_url, unobserved_url]),
+            [output] * 4,
+            message_history=history,
+        )
+
+        assert result.decision == "ESCALATED"
+        assert "공식 URL" in (result.escalation_reason or "")
+        assert calls == 4
+
     def test_실행하지_않은_검색어를_제출하면_보완_조사한다(self):
         unexecuted = _공식_증거_출력("YES")
         unexecuted["search_queries"][0]["query"] = "실행하지 않은 검색어"
@@ -719,6 +810,97 @@ class Test조사실행기록:
         assert result.decision == "YES"
         assert calls == 1
 
+    def test_과거_조회실패_후_성공한_url은_결론_근거로_회복한다(self):
+        output = _공식_증거_출력("YES")
+        history = _조사_기록(
+            query=_검색_계획()[0]["query"],
+            source_url="https://example.com/official",
+            fetch_error=True,
+        ) + [
+            message
+            for query in _검색_계획()
+            for message in _조사_기록(
+                query=query["query"],
+                source_url="https://example.com/official",
+            )
+        ]
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [output],
+            message_history=history,
+        )
+
+        assert result.decision == "YES"
+        assert calls == 1
+
+    def test_native_검색의_queries_목록도_실행한_검색어로_인정한다(self):
+        output = _공식_증거_출력("YES")
+        url = "https://example.com/official"
+        search_id = "search-list"
+        fetch_id = "fetch-official"
+        history = [
+            ModelResponse(
+                parts=[
+                    NativeToolCallPart(
+                        tool_name="web_search",
+                        tool_call_id=search_id,
+                        args={
+                            "queries": [
+                                query["query"] for query in output["search_queries"]
+                            ]
+                        },
+                    ),
+                    NativeToolReturnPart(
+                        tool_name="web_search",
+                        tool_call_id=search_id,
+                        content={"status": "completed", "sources": [{"url": url}]},
+                    ),
+                    ToolCallPart(
+                        tool_name="web_fetch",
+                        tool_call_id=fetch_id,
+                        args={"url": url},
+                    ),
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="web_fetch",
+                        tool_call_id=fetch_id,
+                        content={"url": url, "content": "확정 결과"},
+                    )
+                ]
+            ),
+        ]
+
+        result, _, calls = _run_outputs(_입력(), [output], message_history=history)
+
+        assert result.decision == "YES"
+        assert calls == 1
+
+    def test_native_검색결과의_url이_잘못되어도_예외없이_이관한다(self):
+        output = _공식_증거_출력("YES")
+        history = [
+            message
+            for query in _검색_계획()
+            for message in _조사_기록(
+                query=query["query"],
+                source_url="https://search.example:invalid/result",
+                fetched_url="https://example.com/official",
+            )
+        ]
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [output] * 4,
+            message_history=history,
+        )
+
+        assert result.decision == "ESCALATED"
+        assert "실행 기록" in (result.escalation_reason or "")
+        assert calls == 4
+
     def test_연결되지_않은_native_검색반환의_후보는_보완_조사한다(self):
         output = _고신뢰_증거_출력("YES", ["기관 A", "기관 B"])
         history = [
@@ -775,6 +957,40 @@ class TestResolver실행:
 
         assert result.decision == "ESCALATED"
         assert "검색어" in (result.escalation_reason or "")
+
+    def test_중복을_제외한_공식_url이_여섯개이면_도구호출한도를_열다섯으로_늘린다(
+        self,
+        monkeypatch,
+    ):
+        captured_limits = None
+
+        async def fake_run(_agent, *_args, **kwargs):
+            nonlocal captured_limits
+            captured_limits = kwargs["usage_limits"]
+            return SimpleNamespace(
+                output=InvestigationResult(
+                    prediction_id="prediction-1",
+                    decision="ESCALATED",
+                    summary="테스트 이관",
+                    evidence=[],
+                    escalation_reason="테스트",
+                ),
+                usage=SimpleNamespace(
+                    requests=0,
+                    tool_calls=0,
+                    input_tokens=0,
+                    output_tokens=0,
+                ),
+            )
+
+        monkeypatch.setattr(type(resolver._agent), "run", fake_run)
+        sources = [f"https://official-{index}.example/result" for index in range(6)]
+        sources.append("https://official-0.example/result/")
+
+        asyncio.run(resolver.resolve(_입력(official_sources=sources)))
+
+        assert captured_limits is not None
+        assert captured_limits.tool_calls_limit == 15
 
 
 class Test도구재시도:
