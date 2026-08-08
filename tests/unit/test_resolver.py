@@ -5,7 +5,14 @@ from typing import Any, Literal
 import httpx
 import pytest
 from pydantic_ai import ModelRetry, UnexpectedModelBehavior, models
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    NativeToolCallPart,
+    NativeToolReturnPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from oracle_agent.agents import resolver
@@ -157,6 +164,8 @@ def _충돌_증거_출력() -> dict[str, Any]:
 def _run_outputs(
     investigation: InvestigationInput,
     outputs: list[dict[str, Any]],
+    *,
+    message_history: list[Any] | None = None,
 ) -> tuple[InvestigationResult, list[dict[str, Any]], int]:
     schemas: list[dict[str, Any]] = []
     calls = 0
@@ -171,8 +180,76 @@ def _run_outputs(
         )
 
     with _agent.override(model=FunctionModel(model_function), native_tools=[]):
-        result = asyncio.run(_agent.run("조사 결과를 제출하세요.", deps=investigation))
+        result = asyncio.run(
+            _agent.run(
+                "조사 결과를 제출하세요.",
+                deps=investigation,
+                message_history=message_history or _출력_조사_기록(outputs[-1]),
+            )
+        )
     return result.output, schemas, calls
+
+
+def _조사_기록(
+    *,
+    query: str,
+    source_url: str,
+    fetch_error: bool = False,
+    fetched_url: str | None = None,
+    fetch: bool = True,
+) -> list[Any]:
+    search_id = f"search-{query}"
+    fetch_id = f"fetch-{fetched_url or source_url}"
+    fetch_url = fetched_url or source_url
+    response_parts: list[Any] = [
+        NativeToolCallPart(
+            tool_name="web_search",
+            tool_call_id=search_id,
+            args={"query": query},
+        ),
+        NativeToolReturnPart(
+            tool_name="web_search",
+            tool_call_id=search_id,
+            content={"status": "completed", "sources": [{"url": source_url}]},
+        ),
+    ]
+    if fetch:
+        response_parts.append(
+            ToolCallPart(
+                tool_name="web_fetch",
+                tool_call_id=fetch_id,
+                args={"url": fetch_url},
+            )
+        )
+    fetch_content = (
+        {"url": fetch_url, "error": "조회 실패"}
+        if fetch_error
+        else {"url": fetch_url, "content": "확정 결과"}
+    )
+    request_parts = (
+        [
+            ToolReturnPart(
+                tool_name="web_fetch",
+                tool_call_id=fetch_id,
+                content=fetch_content,
+            )
+        ]
+        if fetch
+        else []
+    )
+    return [ModelResponse(parts=response_parts), ModelRequest(parts=request_parts)]
+
+
+def _출력_조사_기록(output: dict[str, Any]) -> list[Any]:
+    candidates = output["search_candidates"]
+    return [
+        message
+        for index, query in enumerate(output["search_queries"])
+        for message in _조사_기록(
+            query=query["query"],
+            source_url=candidates[index % len(candidates)]["url"],
+        )
+    ]
 
 
 class Test최종출력경계:
@@ -320,6 +397,93 @@ class Test사람검토이관:
         assert calls == 1
 
 
+class Test조사실행기록:
+    def test_실행하지_않은_검색어를_제출하면_보완_조사한다(self):
+        unexecuted = _공식_증거_출력("YES")
+        unexecuted["search_queries"][0]["query"] = "실행하지 않은 검색어"
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [unexecuted, _공식_증거_출력("YES")],
+        )
+
+        assert result.decision == "YES"
+        assert calls == 2
+
+    def test_검색결과에_없는_후보_url이면_보완_조사한다(self):
+        undiscovered = _공식_증거_출력("YES")
+        undiscovered["search_candidates"][0]["url"] = "https://unseen.example/result"
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [undiscovered, _공식_증거_출력("YES")],
+        )
+
+        assert result.decision == "YES"
+        assert calls == 2
+
+    def test_원문을_조회하지_않은_evidence이면_보완_조사한다(self):
+        output = _공식_증거_출력("YES")
+        history = [
+            message
+            for query in _검색_계획()
+            for message in _조사_기록(
+                query=query["query"],
+                source_url="https://example.com/official",
+                fetch=False,
+            )
+        ]
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [output] * 4,
+            message_history=history,
+        )
+
+        assert result.decision == "ESCALATED"
+        assert "원문" in (result.escalation_reason or "")
+        assert calls == 4
+
+    def test_원문_조회에_실패한_url을_결론_근거로_쓰면_보완_조사한다(self):
+        output = _공식_증거_출력("YES")
+        history = [
+            message
+            for query in _검색_계획()
+            for message in _조사_기록(
+                query=query["query"],
+                source_url="https://example.com/official",
+                fetch_error=True,
+            )
+        ]
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [output] * 4,
+            message_history=history,
+        )
+
+        assert result.decision == "ESCALATED"
+        assert "실패" in (result.escalation_reason or "")
+        assert calls == 4
+
+    def test_시장_지정_공식_url은_검색결과에_없어도_후보로_인정한다(self):
+        output = _공식_증거_출력("YES")
+        history = [
+            message
+            for query in _검색_계획()
+            for message in _조사_기록(
+                query=query["query"],
+                source_url="https://search.example/result",
+                fetched_url="https://example.com/official",
+            )
+        ]
+
+        result, _, calls = _run_outputs(_입력(), [output], message_history=history)
+
+        assert result.decision == "YES"
+        assert calls == 1
+
+
 class TestResolver실행:
     def test_판정_가능_시점_전이면_모델을_호출하지_않고_이관한다(self, monkeypatch):
         def 모델을_만들면_실패한다():
@@ -337,7 +501,7 @@ class TestResolver실행:
         assert result.evidence == []
         assert result.prediction_id == "prediction-1"
 
-    def test_agent_override를_사용하면_api_key없이_resolve를_실행한다(self):
+    def test_agent_override가_조사기록없이_출력하면_자동판정하지_않는다(self):
         def model_function(_messages: list[Any], info: AgentInfo) -> ModelResponse:
             return ModelResponse(
                 parts=[
@@ -351,7 +515,8 @@ class TestResolver실행:
         with _agent.override(model=FunctionModel(model_function), native_tools=[]):
             result = asyncio.run(resolver.resolve(_입력()))
 
-        assert result.decision == "YES"
+        assert result.decision == "ESCALATED"
+        assert "검색어" in (result.escalation_reason or "")
 
 
 class Test도구재시도:

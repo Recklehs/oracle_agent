@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import cache
@@ -11,6 +12,13 @@ from pydantic import AnyHttpUrl, BaseModel, Field
 from pydantic_ai import Agent, ModelRetry, RunContext, Tool
 from pydantic_ai.capabilities import SelectModel, WebFetch, WebSearch
 from pydantic_ai.common_tools.web_fetch import web_fetch_tool
+from pydantic_ai.messages import (
+    ModelMessage,
+    NativeToolCallPart,
+    NativeToolReturnPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
@@ -115,6 +123,41 @@ def _normalize_url(value: AnyHttpUrl | str) -> tuple[str, str, str, str]:
     return scheme, authority.casefold(), parsed.path.rstrip("/") or "/", parsed.query
 
 
+@dataclass
+class _InvestigationTrace:
+    queries: set[str]
+    source_urls: set[tuple[str, str, str, str]]
+    fetched_urls: set[tuple[str, str, str, str]]
+    failed_fetch_urls: set[tuple[str, str, str, str]]
+
+
+def _extract_investigation_trace(messages: list[ModelMessage]) -> _InvestigationTrace:
+    fetch_calls: dict[str, tuple[str, str, str, str]] = {}
+    trace = _InvestigationTrace(set(), set(), set(), set())
+    for message in messages:
+        for part in message.parts:
+            if isinstance(part, NativeToolCallPart) and part.tool_name == "web_search":
+                query = part.args_as_dict().get("query")
+                if isinstance(query, str):
+                    trace.queries.add(query.casefold())
+            elif isinstance(part, NativeToolReturnPart) and part.tool_name == "web_search":
+                content = part.content if isinstance(part.content, dict) else {}
+                for source in content.get("sources", []):
+                    if isinstance(source, dict) and isinstance(source.get("url"), str):
+                        trace.source_urls.add(_normalize_url(source["url"]))
+            elif isinstance(part, ToolCallPart) and part.tool_name == "web_fetch":
+                url = part.args_as_dict().get("url")
+                if isinstance(url, str):
+                    fetch_calls[part.tool_call_id] = _normalize_url(url)
+            elif isinstance(part, ToolReturnPart) and part.tool_name == "web_fetch":
+                if url := fetch_calls.get(part.tool_call_id):
+                    if isinstance(part.content, dict) and part.content.get("error"):
+                        trace.failed_fetch_urls.add(url)
+                    else:
+                        trace.fetched_urls.add(url)
+    return trace
+
+
 def _retry_or_escalate(
     ctx: RunContext[InvestigationInput],
     summary: NonEmptyText,
@@ -152,6 +195,41 @@ def finalize_investigation(
             summary,
             evidence,
             "필수 검색 범주마다 서로 다른 검색어가 필요합니다.",
+        )
+
+    trace = _extract_investigation_trace(ctx.messages)
+    if not set(queries) <= trace.queries:
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "제출한 검색어를 실제로 모두 실행해야 합니다.",
+        )
+
+    candidate_urls = {_normalize_url(candidate.url) for candidate in search_candidates}
+    official_urls = {_normalize_url(url) for url in ctx.deps.official_sources}
+    if not candidate_urls <= trace.source_urls | official_urls:
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "검색 결과 또는 시장 지정 공식 URL에 없는 후보입니다.",
+        )
+
+    evidence_urls = {_normalize_url(item["url"]) for item in evidence}
+    if evidence_urls & trace.failed_fetch_urls:
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "원문 조회에 실패한 URL은 결론 근거로 사용할 수 없습니다.",
+        )
+    if not evidence_urls <= candidate_urls or not evidence_urls <= trace.fetched_urls:
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "모든 증거는 후보 원문을 성공적으로 조회해야 합니다.",
         )
 
     normalized_evidence_urls = [_normalize_url(item["url"]) for item in evidence]
