@@ -199,15 +199,8 @@ def finalize_investigation(
     escalation_reason: NonEmptyText | None = None,
 ) -> InvestigationResult:
     """코드 소유 필드를 결합하고 자동 판정 안전 조건을 검사한다."""
-    trace = _extract_investigation_trace(ctx.messages)
     for query in search_queries:
         logger.info("search category=%s query=%r", query.category, query.query)
-    logger.info(
-        "search candidates=%s fetched=%s failed_fetches=%s",
-        len(search_candidates),
-        len(trace.fetched_urls),
-        len(trace.failed_fetch_urls),
-    )
     evidence_by_url = {_normalize_url(item["url"]): item for item in evidence}
     for review in evidence_reviews:
         item = evidence_by_url.get(_normalize_url(review.url))
@@ -275,6 +268,13 @@ def finalize_investigation(
         _normalize_url(review.url): review.fitness for review in evidence_reviews
     }
 
+    trace = _extract_investigation_trace(ctx.messages)
+    logger.info(
+        "search candidates=%s fetched=%s failed_fetches=%s",
+        len(search_candidates),
+        len(trace.fetched_urls),
+        len(trace.failed_fetch_urls),
+    )
     if not set(queries) <= trace.queries:
         return _retry_or_escalate(
             ctx,

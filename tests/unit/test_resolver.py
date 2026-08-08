@@ -837,6 +837,23 @@ def _재시도_상태(response: httpx.Response) -> RetryCallState:
 
 
 class Test조사실행관찰:
+    def test_관찰용_잘못된_조사기록이_구조화된_출력의_보완조사를_막지_않는다(self):
+        output = _공식_증거_출력("YES")
+        output["search_queries"] = output["search_queries"][:-1]
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [output] * 4,
+            message_history=_조사_기록(
+                query="사건 공식 결과",
+                source_url="https://search.example:invalid/result",
+            ),
+        )
+
+        assert result.decision == "ESCALATED"
+        assert "필수 검색 범주" in (result.escalation_reason or "")
+        assert calls == 4
+
     def test_provider_재시도전에_상태와_대기시간을_기록한다(self, caplog):
         state = _재시도_상태(
             httpx.Response(
