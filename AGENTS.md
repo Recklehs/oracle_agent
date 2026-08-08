@@ -19,7 +19,7 @@ MVP의 최우선 기준은 자동 처리율이 아니라 잘못된 자동 판정
 - YES/NO 이진 시장 판정
 - 비동기 작업 생성과 상태 조회
 - 공식 출처 우선 조사와 추가 고신뢰 출처 조사
-- Agent 내부 조사·검토·최대 2회 추가 조사와 사람 검토 이관
+- Agent 내부 조사·검토·최대 3회 추가 조사와 사람 검토 이관
 - SQLite 기반 작업·판정·증거 저장
 - FastAPI 프로세스 내부 작업 처리
 - 상태 조회 API와 완료 Webhook
@@ -43,7 +43,8 @@ Pydantic AI가 책임에 직접 맞는 공개 기능을 제공하면 자체 구�
 Pydantic AI 사용 기준은 다음과 같다.
 
 - 구조화된 최종 조사 결과: `output_type`과 Pydantic 모델
-- 출력 검증과 자기 수정: `output_validator`, `ModelRetry`
+- 코드가 소유한 필드를 붙이는 최종 출력: `RunContext`를 받는 output function
+- 출력 검증과 자기 수정: output function 또는 `output_validator`, `ModelRetry`
 - 웹 검색과 페이지 조회: `pydantic_ai.capabilities.WebSearch`, `WebFetch`
 - 실행 의존성: `deps_type`, `RunContext`
 - 동시 실행 제한: `Agent(max_concurrency=...)` 또는 `ConcurrencyLimit`
@@ -83,12 +84,15 @@ tests/
 │   └── test_models.py
 └── integration/
     └── test_api.py
+
+tests/live/
+└── resolver_live_scenarios.py  # 명시적 opt-in으로만 실행
 ```
 
 - `app.py`: FastAPI 라우트, lifespan, 인프로세스 작업 루프, Agent 결과 저장과 Webhook 전달
 - `models.py`: 요청, 작업, 증거, 조사 결과, 판정 결과의 Pydantic 모델과 enum
 - `db.py`: SQLite 연결, 스키마 초기화, 작업 저장·선점·조회·상태 변경
-- `agents/resolver.py`: 재사용 가능한 Pydantic AI Agent, 조사·검토·추가 조사 흐름, 지시문, 구조화된 최종 출력
+- `agents/resolver.py`: 재사용 가능한 Pydantic AI Agent, 조사·검토·추가 조사 흐름, 지시문, 코드 소유 필드를 붙이는 output function
 - `agents/tools.py`: 웹 검색과 페이지 조회 등 Agent 도구
 - `agents/hooks.py`: 로깅·측정 등 실제 Hook이 필요할 때만 생성
 
@@ -101,8 +105,8 @@ tests/
 3. FastAPI lifespan에서 시작된 비동기 작업 루프가 작업을 원자적으로 선점해 `running`으로 바꾼다.
 4. Pydantic AI Agent가 공식 출처를 우선 조사하고 필요하면 추가 출처를 찾아 구조화된 조사 결과 초안을 만든다.
 5. Agent가 초안의 근거와 결론을 검토한다.
-6. 검토에서 문제가 발견되면 검토 의견을 반영해 최대 2회 추가 조사한다.
-7. Agent가 최종 `YES`, `NO`, `ESCALATED`와 구조화된 증거를 반환한다.
+6. 검토에서 문제가 발견되면 검토 의견을 반영해 최대 3회 추가 조사한다.
+7. output function이 입력의 `prediction_id`를 붙이고 최종 `YES`, `NO`, `ESCALATED`와 구조화된 증거를 반환한다.
 8. 결과를 `resolved`, `escalated`, `failed` 중 하나로 저장한다.
 9. 저장 후 완료 또는 이관 Webhook을 전달한다.
 
@@ -157,6 +161,7 @@ MVP는 단일 Uvicorn 프로세스로 실행한다. 서버 시작 시 이전 프
 - `ALLOW_MODEL_REQUESTS=False`로 기본 테스트의 실제 모델 호출을 차단한다.
 - 외부 검색과 Webhook만 `monkeypatch`로 대체한다.
 - 실제 LLM과 인터넷을 호출하는 검증은 기본 테스트에 넣지 않는다.
+- 실제 LLM과 인터넷을 호출하는 시나리오는 `tests/live/resolver_live_scenarios.py`에 둔다. 파일명이 pytest 기본 수집 패턴과 다르므로 전체 테스트에 포함되지 않으며, `RUN_ORACLE_LIVE_TESTS=1`과 파일 경로를 함께 지정한 수동 명령으로만 실행한다.
 
 테스트 실패 node ID만 보고도 행동과 기대 결과를 한국어로 이해할 수 있어야 한다.
 
