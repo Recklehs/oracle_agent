@@ -161,7 +161,7 @@ MVP는 단일 Uvicorn 프로세스로 실행한다. 서버 시작 시 이전 프
 - `ALLOW_MODEL_REQUESTS=False`로 기본 테스트의 실제 모델 호출을 차단한다.
 - 외부 검색과 Webhook만 `monkeypatch`로 대체한다.
 - 실제 LLM과 인터넷을 호출하는 검증은 기본 테스트에 넣지 않는다.
-- 실제 LLM과 인터넷을 호출하는 시나리오는 `tests/live/resolver_live_scenarios.py`에 둔다. 파일명이 pytest 기본 수집 패턴과 다르므로 전체 테스트에 포함되지 않으며, `RUN_ORACLE_LIVE_TESTS=1`과 파일 경로를 함께 지정한 수동 명령으로만 실행한다.
+- 실제 LLM과 인터넷을 호출하는 시나리오는 `tests/live/resolver_live_scenarios.py`에 둔다. 파일명이 pytest 기본 수집 패턴과 다르므로 전체 테스트에 포함되지 않으며, `RUN_ORACLE_LIVE_TESTS=1`과 파일 경로를 함께 지정한 수동 명령으로만 실행한다. 로컬 API 키는 Git이 무시하는 `.env`의 `OPENAI_API_KEY`에 사용자가 직접 넣고 `uv run --env-file .env`로 읽는다.
 
 테스트 실패 node ID만 보고도 행동과 기대 결과를 한국어로 이해할 수 있어야 한다.
 
