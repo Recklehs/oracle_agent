@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -14,6 +15,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from tenacity import RetryAction, RetryCallState, Retrying
 
 from oracle_agent.agents import resolver
 from oracle_agent.agents.resolver import _agent
@@ -825,6 +827,42 @@ def _http_status_error(response: httpx.Response) -> httpx.HTTPStatusError:
     except httpx.HTTPStatusError as error:
         return error
     raise AssertionError("HTTP 오류 응답이 필요합니다")
+
+
+def _재시도_상태(response: httpx.Response) -> RetryCallState:
+    state = RetryCallState(Retrying(), None, (), {})
+    state.set_exception((httpx.HTTPStatusError, _http_status_error(response), None))
+    state.next_action = RetryAction(1)
+    return state
+
+
+class Test조사실행관찰:
+    def test_provider_재시도전에_상태와_대기시간을_기록한다(self, caplog):
+        state = _재시도_상태(
+            httpx.Response(
+                429,
+                headers={"retry-after": "20"},
+                request=httpx.Request("POST", "https://api.openai.com"),
+            )
+        )
+
+        resolver._log_provider_retry(state)
+
+        assert "429" in caplog.text
+        assert "20" in caplog.text
+
+    def test_resolve가_agent_사용량을_기록한다(self, caplog):
+        def model_function(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(
+                parts=[ToolCallPart(info.output_tools[0].name, _공식_증거_출력("YES"))],
+            )
+
+        caplog.set_level(logging.INFO, logger=resolver.__name__)
+        with _agent.override(model=FunctionModel(model_function), native_tools=[]):
+            asyncio.run(resolver.resolve(_입력()))
+
+        assert "requests=" in caplog.text
+        assert "tool_calls=" in caplog.text
 
 
 class TestProviderHttp재시도:

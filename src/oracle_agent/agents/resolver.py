@@ -1,4 +1,5 @@
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -23,7 +24,7 @@ from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
 from pydantic_ai.usage import UsageLimits
-from tenacity import retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import RetryCallState, retry_if_exception, stop_after_attempt, wait_exponential
 
 from oracle_agent.models import (
     Evidence,
@@ -35,6 +36,7 @@ from oracle_agent.models import (
 
 MAX_OUTPUT_RETRIES = 3
 RETRYABLE_HTTP_STATUSES = {429, 502, 503, 504}
+logger = logging.getLogger(__name__)
 USAGE_LIMITS = UsageLimits(
     request_limit=12,
     tool_calls_limit=12,
@@ -197,6 +199,25 @@ def finalize_investigation(
     escalation_reason: NonEmptyText | None = None,
 ) -> InvestigationResult:
     """코드 소유 필드를 결합하고 자동 판정 안전 조건을 검사한다."""
+    trace = _extract_investigation_trace(ctx.messages)
+    for query in search_queries:
+        logger.info("search category=%s query=%r", query.category, query.query)
+    logger.info(
+        "search candidates=%s fetched=%s failed_fetches=%s",
+        len(search_candidates),
+        len(trace.fetched_urls),
+        len(trace.failed_fetch_urls),
+    )
+    evidence_by_url = {_normalize_url(item["url"]): item for item in evidence}
+    for review in evidence_reviews:
+        item = evidence_by_url.get(_normalize_url(review.url))
+        logger.info(
+            "evidence url=%s authority=%s fitness=%s",
+            review.url,
+            item["authority"] if item else None,
+            review.fitness,
+        )
+
     categories = {query.category for query in search_queries}
     queries = [query.query.casefold() for query in search_queries]
     if categories != set(SearchCategory) or len(queries) != len(set(queries)):
@@ -254,7 +275,6 @@ def finalize_investigation(
         _normalize_url(review.url): review.fitness for review in evidence_reviews
     }
 
-    trace = _extract_investigation_trace(ctx.messages)
     if not set(queries) <= trace.queries:
         return _retry_or_escalate(
             ctx,
@@ -395,6 +415,20 @@ def _is_retryable_http_error(error: BaseException) -> bool:
     )
 
 
+def _log_provider_retry(retry_state: RetryCallState) -> None:
+    error = retry_state.outcome.exception() if retry_state.outcome else None
+    response = error.response if isinstance(error, httpx.HTTPStatusError) else None
+    logger.warning(
+        "provider retry attempt=%s status=%s wait=%s retry_after=%s remaining_requests=%s remaining_tokens=%s",
+        retry_state.attempt_number,
+        response.status_code if response else None,
+        retry_state.next_action.sleep if retry_state.next_action else None,
+        response.headers.get("retry-after") if response else None,
+        response.headers.get("x-ratelimit-remaining-requests") if response else None,
+        response.headers.get("x-ratelimit-remaining-tokens") if response else None,
+    )
+
+
 def _retrying_transport(
     wrapped: httpx.AsyncBaseTransport | None = None,
 ) -> AsyncTenacityTransport:
@@ -406,6 +440,7 @@ def _retrying_transport(
                 fallback_strategy=wait_exponential(multiplier=1, max=8),
                 max_wait=30,
             ),
+            before_sleep=_log_provider_retry,
             reraise=True,
         ),
         wrapped=wrapped,
@@ -497,5 +532,13 @@ async def resolve(investigation: InvestigationInput) -> InvestigationResult:
         "공식 출처부터 조사를 수행하고 최종 결과를 제출하세요.",
         deps=investigation,
         usage_limits=USAGE_LIMITS,
+    )
+    usage = result.usage
+    logger.info(
+        "agent usage requests=%s tool_calls=%s input_tokens=%s output_tokens=%s",
+        usage.requests,
+        usage.tool_calls,
+        usage.input_tokens,
+        usage.output_tokens,
     )
     return result.output
