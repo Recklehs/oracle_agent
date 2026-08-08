@@ -2,9 +2,9 @@
 실제 Luna와 인터넷을 사용하는 수동 시나리오.
 
 1. Git이 무시하는 `.env`의 `OPENAI_API_KEY=` 뒤에 직접 키를 넣는다.
-2. 다음 명령으로 이 파일만 명시적으로 실행한다.
+2. 다음 스크립트로 이 파일만 명시적으로 실행한다.
 
-RUN_ORACLE_LIVE_TESTS=1 uv run --env-file .env pytest tests/live/resolver_live_scenarios.py -v -s
+./tests/live/run_live_tests.sh
 
 키를 테스트 코드나 추적되는 파일에 기록하지 않는다.
 """
