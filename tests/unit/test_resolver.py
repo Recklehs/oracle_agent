@@ -3,7 +3,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import httpx
-from pydantic_ai import models
+import pytest
+from pydantic_ai import ModelRetry, UnexpectedModelBehavior, models
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -185,6 +186,8 @@ class Test추가조사:
 
         assert result.decision == "ESCALATED"
         assert result.evidence
+        assert "현재 1개" in (result.escalation_reason or "")
+        assert "2개 필요" in (result.escalation_reason or "")
         assert calls == 4
 
     def test_같은_원출처의_재게시_두개는_독립_증거_하나로_계산한다(self):
@@ -196,6 +199,31 @@ class Test추가조사:
         )
 
         assert result.decision == "ESCALATED"
+        assert calls == 4
+
+    def test_공식_url을_세번_보완해도_확인하지_못하면_이관한다(self):
+        missing_official = _고신뢰_증거_출력("YES", ["기관 A", "기관 B"])
+
+        result, _, calls = _run_outputs(_입력(), [missing_official] * 4)
+
+        assert result.decision == "ESCALATED"
+        assert "공식 URL" in (result.escalation_reason or "")
+        assert calls == 4
+
+    def test_잘못된_output을_세번_수정하지_못하면_예외를_전달한다(self):
+        calls = 0
+
+        def model_function(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+            nonlocal calls
+            calls += 1
+            return ModelResponse(
+                parts=[ToolCallPart(info.output_tools[0].name, {})],
+            )
+
+        with _agent.override(model=FunctionModel(model_function), native_tools=[]):
+            with pytest.raises(UnexpectedModelBehavior):
+                asyncio.run(_agent.run("조사 결과를 제출하세요.", deps=_입력()))
+
         assert calls == 4
 
 
@@ -228,6 +256,66 @@ class TestResolver실행:
         assert result.evidence == []
         assert result.prediction_id == "prediction-1"
 
+    def test_agent_override를_사용하면_api_key없이_resolve를_실행한다(self):
+        def model_function(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        info.output_tools[0].name,
+                        _공식_증거_출력("YES"),
+                    )
+                ],
+            )
+
+        with _agent.override(model=FunctionModel(model_function), native_tools=[]):
+            result = asyncio.run(resolver.resolve(_입력()))
+
+        assert result.decision == "YES"
+
+
+class Test도구재시도:
+    def test_도구가_계속_실패하면_최초_포함_세번_시도하고_예외를_전달한다(self):
+        calls = 0
+
+        def always_fails() -> str:
+            nonlocal calls
+            calls += 1
+            raise ModelRetry("일시적인 도구 실패")
+
+        def model_function(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[ToolCallPart("always_fails", {})])
+
+        with _agent.override(
+            model=FunctionModel(model_function),
+            tools=[always_fails],
+            native_tools=[],
+        ):
+            with pytest.raises(UnexpectedModelBehavior):
+                asyncio.run(_agent.run("도구를 호출하세요.", deps=_입력()))
+
+        assert calls == 3
+
+
+class Test웹조회실패:
+    def test_페이지를_계속_조회하지_못하면_세번_시도하고_실패_정보를_반환한다(
+        self,
+        monkeypatch,
+    ):
+        attempts = 0
+
+        async def always_fails(_url: str):
+            nonlocal attempts
+            attempts += 1
+            raise ModelRetry("페이지에 접근할 수 없습니다")
+
+        monkeypatch.setattr(resolver._raw_web_fetch_tool, "function", always_fails)
+
+        result = asyncio.run(resolver._fetch_web_page("https://unavailable.example"))
+
+        assert result["url"] == "https://unavailable.example"
+        assert "접근할 수 없습니다" in result["error"]
+        assert attempts == 3
+
 
 def _http_status_error(response: httpx.Response) -> httpx.HTTPStatusError:
     try:
@@ -252,3 +340,25 @@ class TestProviderHttp재시도:
         assert resolver._is_retryable_http_error(timeout)
         assert resolver._is_retryable_http_error(_http_status_error(rate_limit))
         assert not resolver._is_retryable_http_error(_http_status_error(bad_request))
+
+    def test_재시도_가능한_http_오류는_최초_포함_세번_시도한다(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(503, request=request)
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        async def request() -> None:
+            transport = resolver._retrying_transport(httpx.MockTransport(handler))
+            transport.config["sleep"] = no_sleep
+            async with httpx.AsyncClient(transport=transport) as client:
+                with pytest.raises(httpx.HTTPStatusError):
+                    await client.get("https://api.openai.com/test")
+
+        asyncio.run(request())
+
+        assert attempts == 3
