@@ -197,6 +197,7 @@ def _조사_기록(
     fetch_error: bool = False,
     fetched_url: str | None = None,
     fetch: bool = True,
+    search_return_id: str | None = None,
 ) -> list[Any]:
     search_id = f"search-{query}"
     fetch_id = f"fetch-{fetched_url or source_url}"
@@ -209,7 +210,7 @@ def _조사_기록(
         ),
         NativeToolReturnPart(
             tool_name="web_search",
-            tool_call_id=search_id,
+            tool_call_id=search_return_id or search_id,
             content={"status": "completed", "sources": [{"url": source_url}]},
         ),
     ]
@@ -482,6 +483,70 @@ class Test조사실행기록:
 
         assert result.decision == "YES"
         assert calls == 1
+
+    def test_조회에_실패한_inconclusive_증거와_성공한_공식_증거가_있으면_yes를_승인한다(
+        self,
+    ):
+        failed_url = "https://failed.example/result"
+        confirmed_url = "https://confirmed.example/result"
+        output = _출력(
+            "YES",
+            [
+                _증거(
+                    "INCONCLUSIVE",
+                    url=failed_url,
+                    authority="official",
+                    publisher="실패한 공식 기관",
+                ),
+                _증거(
+                    "YES",
+                    url=confirmed_url,
+                    authority="official",
+                    publisher="확정한 공식 기관",
+                ),
+            ],
+        )
+        output["evidence_reviews"][0]["fitness"] = "INCONCLUSIVE"
+        history = [
+            message
+            for index, query in enumerate(_검색_계획())
+            for message in _조사_기록(
+                query=query["query"],
+                source_url=failed_url if index == 0 else confirmed_url,
+                fetch_error=index == 0,
+            )
+        ]
+
+        result, _, calls = _run_outputs(
+            _입력(official_sources=[failed_url, confirmed_url]),
+            [output],
+            message_history=history,
+        )
+
+        assert result.decision == "YES"
+        assert calls == 1
+
+    def test_연결되지_않은_native_검색반환의_후보는_보완_조사한다(self):
+        output = _고신뢰_증거_출력("YES", ["기관 A", "기관 B"])
+        history = [
+            message
+            for index, query in enumerate(_검색_계획())
+            for message in _조사_기록(
+                query=query["query"],
+                source_url=output["search_candidates"][index % 2]["url"],
+                search_return_id=f"unmatched-{index}",
+            )
+        ]
+
+        result, _, calls = _run_outputs(
+            _입력(official_sources=[]),
+            [output] * 4,
+            message_history=history,
+        )
+
+        assert result.decision == "ESCALATED"
+        assert "검색 결과" in (result.escalation_reason or "")
+        assert calls == 4
 
 
 class TestResolver실행:

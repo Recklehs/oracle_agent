@@ -132,15 +132,21 @@ class _InvestigationTrace:
 
 
 def _extract_investigation_trace(messages: list[ModelMessage]) -> _InvestigationTrace:
+    search_calls: set[str] = set()
     fetch_calls: dict[str, tuple[str, str, str, str]] = {}
     trace = _InvestigationTrace(set(), set(), set(), set())
     for message in messages:
         for part in message.parts:
             if isinstance(part, NativeToolCallPart) and part.tool_name == "web_search":
+                search_calls.add(part.tool_call_id)
                 query = part.args_as_dict().get("query")
                 if isinstance(query, str):
                     trace.queries.add(query.casefold())
-            elif isinstance(part, NativeToolReturnPart) and part.tool_name == "web_search":
+            elif (
+                isinstance(part, NativeToolReturnPart)
+                and part.tool_name == "web_search"
+                and part.tool_call_id in search_calls
+            ):
                 content = part.content if isinstance(part.content, dict) else {}
                 for source in content.get("sources", []):
                     if isinstance(source, dict) and isinstance(source.get("url"), str):
@@ -197,6 +203,23 @@ def finalize_investigation(
             "필수 검색 범주마다 서로 다른 검색어가 필요합니다.",
         )
 
+    normalized_evidence_urls = [_normalize_url(item["url"]) for item in evidence]
+    normalized_review_urls = [_normalize_url(review.url) for review in evidence_reviews]
+    if (
+        len(normalized_evidence_urls) != len(set(normalized_evidence_urls))
+        or len(normalized_evidence_urls) != len(normalized_review_urls)
+        or set(normalized_evidence_urls) != set(normalized_review_urls)
+    ):
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "각 증거에는 정확히 하나의 적합성 검토가 필요합니다.",
+        )
+    fitness_by_url = {
+        _normalize_url(review.url): review.fitness for review in evidence_reviews
+    }
+
     trace = _extract_investigation_trace(ctx.messages)
     if not set(queries) <= trace.queries:
         return _retry_or_escalate(
@@ -216,38 +239,27 @@ def finalize_investigation(
             "검색 결과 또는 시장 지정 공식 URL에 없는 후보입니다.",
         )
 
-    evidence_urls = {_normalize_url(item["url"]) for item in evidence}
-    if evidence_urls & trace.failed_fetch_urls:
+    evidence_urls = set(normalized_evidence_urls)
+    automatic_evidence_urls = {
+        _normalize_url(item["url"])
+        for item in evidence
+        if item["supports"] == decision
+        and fitness_by_url[_normalize_url(item["url"])] is EvidenceFitness.FINAL
+    }
+    if automatic_evidence_urls & trace.failed_fetch_urls:
         return _retry_or_escalate(
             ctx,
             summary,
             evidence,
             "원문 조회에 실패한 URL은 결론 근거로 사용할 수 없습니다.",
         )
-    if not evidence_urls <= candidate_urls or not evidence_urls <= trace.fetched_urls:
+    if not evidence_urls <= candidate_urls or not automatic_evidence_urls <= trace.fetched_urls:
         return _retry_or_escalate(
             ctx,
             summary,
             evidence,
             "모든 증거는 후보 원문을 성공적으로 조회해야 합니다.",
         )
-
-    normalized_evidence_urls = [_normalize_url(item["url"]) for item in evidence]
-    normalized_review_urls = [_normalize_url(review.url) for review in evidence_reviews]
-    if (
-        len(normalized_evidence_urls) != len(set(normalized_evidence_urls))
-        or len(normalized_evidence_urls) != len(normalized_review_urls)
-        or set(normalized_evidence_urls) != set(normalized_review_urls)
-    ):
-        return _retry_or_escalate(
-            ctx,
-            summary,
-            evidence,
-            "각 증거에는 정확히 하나의 적합성 검토가 필요합니다.",
-        )
-    fitness_by_url = {
-        _normalize_url(review.url): review.fitness for review in evidence_reviews
-    }
 
     observed_urls = {_normalize_url(item["url"]) for item in evidence}
     missing_official_urls = [
