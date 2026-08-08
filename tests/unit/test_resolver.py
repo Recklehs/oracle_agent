@@ -110,6 +110,27 @@ def _검색_계획() -> list[dict[str, object]]:
     ]
 
 
+def _검색_후보들(
+    count: int,
+    *,
+    discovered_by: str = "OFFICIAL",
+) -> list[dict[str, str]]:
+    return [
+        {
+            "url": (
+                "https://example.com/official"
+                if index == 1
+                else f"https://candidate-{index}.example/result"
+            ),
+            "title": f"후보 {index}",
+            "source_domain": "example.com",
+            "discovered_by": discovered_by,
+            "preliminary_authority": "official",
+        }
+        for index in range(1, count + 1)
+    ]
+
+
 def _공식_증거_출력(direction: Direction, *, fitness: str = "FINAL") -> dict[str, Any]:
     return _출력(
         direction,
@@ -253,6 +274,17 @@ def _출력_조사_기록(output: dict[str, Any]) -> list[Any]:
     ]
 
 
+def _모든_후보_조사_기록(output: dict[str, Any]) -> list[Any]:
+    return _출력_조사_기록(output) + [
+        message
+        for candidate in output["search_candidates"][4:]
+        for message in _조사_기록(
+            query=_검색_계획()[0]["query"],
+            source_url=candidate["url"],
+        )
+    ]
+
+
 class Test최종출력경계:
     def test_모델_output_schema에는_prediction_id가_없고_결과에는_입력값을_붙인다(self):
         result, schemas, _ = _run_outputs(_입력(), [_공식_증거_출력("YES")])
@@ -297,6 +329,130 @@ class Test검색계획검토:
 
         assert result.decision == "YES"
         assert calls == 2
+
+
+class Test조사지시문:
+    @pytest.mark.parametrize(
+        "required",
+        ["OFFICIAL", "CURRENT", "SUPPORTS_YES", "SUPPORTS_NO", "원문", "최대 5개", "FINAL"],
+        ids=["OFFICIAL", "CURRENT", "SUPPORTS_YES", "SUPPORTS_NO", "원문", "최대_5개", "FINAL"],
+    )
+    def test_조사지시문에_필수_검색과_원문검증_규칙이_있다(self, required: str):
+        assert required in resolver.INVESTIGATION_INSTRUCTIONS
+
+
+class Test후보조회한도:
+    def test_검색으로_발견한_후보가_다섯개를_넘으면_보완_조사한다(self):
+        output = _공식_증거_출력("YES")
+        output["search_candidates"] = _검색_후보들(6)
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [output, _공식_증거_출력("YES")],
+            message_history=_모든_후보_조사_기록(output),
+        )
+
+        assert result.decision == "YES"
+        assert calls == 2
+
+    def test_시장_지정_공식_후보는_다섯개_한도에서_제외한다(self):
+        candidates = _검색_후보들(
+            6,
+            discovered_by="MARKET_OFFICIAL_SOURCE",
+        )
+        output = _출력(
+            "YES",
+            [
+                _증거(
+                    "YES",
+                    url=candidate["url"],
+                    authority="official",
+                    publisher=f"공식 기관 {index}",
+                )
+                for index, candidate in enumerate(candidates, start=1)
+            ],
+        )
+        output["search_candidates"] = candidates
+
+        result, _, calls = _run_outputs(
+            _입력(official_sources=[candidate["url"] for candidate in candidates]),
+            [output],
+            message_history=_모든_후보_조사_기록(output),
+        )
+
+        assert result.decision == "YES"
+        assert calls == 1
+
+    def test_시장_지정되지_않은_후보는_공식_표시여도_한도에_포함한다(self):
+        output = _공식_증거_출력("YES")
+        output["search_candidates"] = _검색_후보들(
+            7,
+            discovered_by="MARKET_OFFICIAL_SOURCE",
+        )
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [output, _공식_증거_출력("YES")],
+            message_history=_모든_후보_조사_기록(output),
+        )
+
+        assert result.decision == "YES"
+        assert calls == 2
+
+
+class Test자기검토:
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "criteria_clear",
+            "result_period_complete",
+            "findings_match_sources",
+            "duplicate_publishers_checked",
+            "contradiction_search_complete",
+        ],
+        ids=[
+            "기준_명확성",
+            "결과_기간_완료",
+            "근거_일치",
+            "원출처_중복",
+            "반증_검색",
+        ],
+    )
+    def test_yes_no_자기검토_필수항목이_거짓이면_보완_조사한다(self, field: str):
+        incomplete = _공식_증거_출력("YES")
+        incomplete["self_review"][field] = False
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [incomplete, _공식_증거_출력("YES")],
+        )
+
+        assert result.decision == "YES"
+        assert calls == 2
+
+    def test_yes_no_자기검토에_남은_조사가_있으면_보완_조사한다(self):
+        incomplete = _공식_증거_출력("YES")
+        incomplete["self_review"]["missing_research"] = ["기준일 확인"]
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [incomplete, _공식_증거_출력("YES")],
+        )
+
+        assert result.decision == "YES"
+        assert calls == 2
+
+    def test_이관은_구체적_사유가_있으면_불완전한_자기검토를_허용한다(self):
+        output = _공식_증거_출력("YES")
+        output["decision"] = "ESCALATED"
+        output["self_review"]["criteria_clear"] = False
+        output["escalation_reason"] = "시장 기준일 해석이 모호합니다."
+
+        result, _, calls = _run_outputs(_입력(), [output])
+
+        assert result.decision == "ESCALATED"
+        assert result.escalation_reason == "시장 기준일 해석이 모호합니다."
+        assert calls == 1
 
 
 class Test증거적합성검토:
