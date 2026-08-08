@@ -26,7 +26,7 @@ class InvestigationInput(BaseModel):
     prediction: NonEmptyText
     resolution_criteria: NonEmptyText
     resolve_after: AwareDatetime
-    official_sources: list[AnyHttpUrl] = Field(default_factory=list)
+    official_sources: list[AnyHttpUrl] = Field(default_factory=list, max_length=10)
 
 
 Evidence = TypedDict(

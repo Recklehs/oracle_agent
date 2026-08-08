@@ -66,6 +66,31 @@ class TestAgent입력DTO:
                 resolve_after=datetime(2026, 8, 8, 18, 0),
             )
 
+    def test_공식_출처가_열개이면_입력_dto를_생성한다(self):
+        investigation_input = models.InvestigationInput(
+            prediction_id="prediction-123",
+            prediction="대한민국이 결승전에서 승리한다.",
+            resolution_criteria="공식 결과가 승리이면 YES다.",
+            resolve_after=datetime(2026, 8, 8, 18, 0, tzinfo=timezone.utc),
+            official_sources=[
+                f"https://official-{index}.example/result" for index in range(10)
+            ],
+        )
+
+        assert len(investigation_input.official_sources) == 10
+
+    def test_공식_출처가_열한개이면_검증에_실패한다(self):
+        with pytest.raises(ValidationError):
+            models.InvestigationInput(
+                prediction_id="prediction-123",
+                prediction="대한민국이 결승전에서 승리한다.",
+                resolution_criteria="공식 결과가 승리이면 YES다.",
+                resolve_after=datetime(2026, 8, 8, 18, 0, tzinfo=timezone.utc),
+                official_sources=[
+                    f"https://official-{index}.example/result" for index in range(11)
+                ],
+            )
+
 
 class TestAgent반환DTO:
     def test_같은_방향의_증거가_있는_yes_결과이면_반환_dto를_생성한다(self):
