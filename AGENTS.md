@@ -10,7 +10,7 @@ Oracle Agent는 prediction market의 YES/NO 이진 시장을 종료할 때 현�
 
 MVP의 최우선 기준은 자동 처리율이 아니라 잘못된 자동 판정을 최소화하는 것이다.
 
-상세 설계는 `docs/superpowers/specs/2026-08-06-oracle-agent-architecture-design.md`를 참고한다.
+전체 서비스 설계는 `docs/superpowers/specs/2026-08-06-oracle-agent-architecture-design.md`를 참고한다. Agent의 조사·검토 흐름과 DTO는 `docs/superpowers/specs/2026-08-08-agent-investigation-dtos-design.md`를 우선한다.
 
 ## MVP 범위
 
@@ -19,7 +19,7 @@ MVP의 최우선 기준은 자동 처리율이 아니라 잘못된 자동 판정
 - YES/NO 이진 시장 판정
 - 비동기 작업 생성과 상태 조회
 - 공식 출처 우선 조사와 추가 고신뢰 출처 조사
-- 결정론적 자동 판정 정책과 사람 검토 이관
+- Agent 내부 조사·검토·최대 2회 추가 조사와 사람 검토 이관
 - SQLite 기반 작업·판정·증거 저장
 - FastAPI 프로세스 내부 작업 처리
 - 상태 조회 API와 완료 Webhook
@@ -42,7 +42,7 @@ Pydantic AI가 책임에 직접 맞는 공개 기능을 제공하면 자체 구�
 
 Pydantic AI 사용 기준은 다음과 같다.
 
-- 구조화된 조사 결과: `output_type`과 Pydantic 모델
+- 구조화된 최종 조사 결과: `output_type`과 Pydantic 모델
 - 출력 검증과 자기 수정: `output_validator`, `ModelRetry`
 - 웹 검색과 페이지 조회: `pydantic_ai.capabilities.WebSearch`, `WebFetch`
 - 실행 의존성: `deps_type`, `RunContext`
@@ -57,7 +57,6 @@ Pydantic AI 사용 기준은 다음과 같다.
 
 - 외부 HTTP 요청 접수: FastAPI
 - 작업과 판정 결과 저장: 표준 `sqlite3`
-- 자동 정산 허용 여부: `resolution.py`의 결정론적 정책
 - Webhook 전달: 프로젝트의 HTTP client
 
 Pydantic AI의 durable execution은 Temporal, DBOS, Prefect, Restate 같은 별도 실행 인프라가 필요하므로 MVP에서는 사용하지 않는다. Deferred tools도 사람 검토 결과를 Agent 실행에 다시 주입해야 할 때만 도입한다.
@@ -72,7 +71,6 @@ src/oracle_agent/
 ├── app.py
 ├── models.py
 ├── db.py
-├── resolution.py
 └── agents/
     ├── __init__.py
     ├── resolver.py
@@ -81,17 +79,16 @@ src/oracle_agent/
 
 tests/
 ├── unit/
-│   ├── test_resolution.py
+│   ├── test_resolver.py
 │   └── test_models.py
 └── integration/
     └── test_api.py
 ```
 
-- `app.py`: FastAPI 라우트, lifespan, 인프로세스 작업 루프
+- `app.py`: FastAPI 라우트, lifespan, 인프로세스 작업 루프, Agent 결과 저장과 Webhook 전달
 - `models.py`: 요청, 작업, 증거, 조사 결과, 판정 결과의 Pydantic 모델과 enum
 - `db.py`: SQLite 연결, 스키마 초기화, 작업 저장·선점·조회·상태 변경
-- `resolution.py`: Agent 실행, 자동 판정 정책, 결과 저장, Webhook 전달 조율
-- `agents/resolver.py`: 재사용 가능한 Pydantic AI Agent, 지시문, 구조화된 출력
+- `agents/resolver.py`: 재사용 가능한 Pydantic AI Agent, 조사·검토·추가 조사 흐름, 지시문, 구조화된 최종 출력
 - `agents/tools.py`: 웹 검색과 페이지 조회 등 Agent 도구
 - `agents/hooks.py`: 로깅·측정 등 실제 Hook이 필요할 때만 생성
 
@@ -102,11 +99,12 @@ tests/
 1. `POST /v1/resolution-jobs`가 요청을 검증한다.
 2. 작업을 SQLite에 `queued`로 저장하고 `202 Accepted`, `job_id`, `status_url`을 반환한다.
 3. FastAPI lifespan에서 시작된 비동기 작업 루프가 작업을 원자적으로 선점해 `running`으로 바꾼다.
-4. Pydantic AI Agent가 공식 출처를 우선 조사하고 필요하면 추가 출처를 찾는다.
-5. Agent가 판정 후보와 구조화된 증거를 반환한다.
-6. `resolution.py`가 결정론적 자동 판정 정책을 적용한다.
-7. 결과를 `resolved`, `escalated`, `failed` 중 하나로 저장한다.
-8. 저장 후 완료 또는 이관 Webhook을 전달한다.
+4. Pydantic AI Agent가 공식 출처를 우선 조사하고 필요하면 추가 출처를 찾아 구조화된 조사 결과 초안을 만든다.
+5. Agent가 초안의 근거와 결론을 검토한다.
+6. 검토에서 문제가 발견되면 검토 의견을 반영해 최대 2회 추가 조사한다.
+7. Agent가 최종 `YES`, `NO`, `ESCALATED`와 구조화된 증거를 반환한다.
+8. 결과를 `resolved`, `escalated`, `failed` 중 하나로 저장한다.
+9. 저장 후 완료 또는 이관 Webhook을 전달한다.
 
 상태 전이는 다음만 허용한다.
 
@@ -118,9 +116,9 @@ queued → running → resolved | escalated | failed
 
 MVP는 단일 Uvicorn 프로세스로 실행한다. 서버 시작 시 이전 프로세스가 남긴 모든 `running` 작업을 `queued`로 되돌리고 다시 처리한다. Agent 동시 실행 수는 Pydantic AI 기능으로 제한한다.
 
-## 자동 판정 안전 규칙
+## Agent 최종 결과 안전 규칙
 
-Agent의 confidence 숫자만으로 자동 판정하지 않는다. 다음 중 하나를 만족할 때만 자동 판정한다.
+검토 과정은 Agent의 confidence 숫자만으로 `YES` 또는 `NO`를 승인하지 않는다. 다음 중 하나를 만족할 때만 `YES` 또는 `NO`를 최종 결과로 반환한다.
 
 1. 시장이 지정한 공식 출처가 종료 조건과 결과를 명확히 확인한다.
 2. 서로 독립적인 복수의 고신뢰 출처가 같은 결과를 지지한다.
@@ -152,8 +150,8 @@ Agent의 confidence 숫자만으로 자동 판정하지 않는다. 다음 중 �
 
 단위 테스트와 통합 테스트를 모두 중요하게 작성하며 기본 `pytest`에서 함께 실행한다.
 
-- 단위 테스트: 모델 불변 조건, 상태 전이, 공식 출처 판정, 복수 출처 판정, 이관 정책
-- 통합 테스트: FastAPI 요청, 임시 SQLite, 인프로세스 작업 루프, Agent 결과 처리, 상태 조회, Webhook, 재시작 복구
+- 단위 테스트: 모델 불변 조건, 상태 전이, 공식 출처 검토 승인, 복수 출처 검토 승인, 추가 조사, 이관
+- 통합 테스트: FastAPI 요청, 임시 SQLite, 인프로세스 작업 루프, Agent 조사·검토 결과 처리, 상태 조회, Webhook, 재시작 복구
 - 통합 테스트는 `tmp_path`로 테스트별 SQLite를 격리한다.
 - Agent 모델은 `TestModel` 또는 `FunctionModel`과 `Agent.override`로 교체한다.
 - `ALLOW_MODEL_REQUESTS=False`로 기본 테스트의 실제 모델 호출을 차단한다.
@@ -169,8 +167,8 @@ Agent의 confidence 숫자만으로 자동 판정하지 않는다. 다음 중 �
 - 파라미터 테스트에는 각 사례를 구분하는 명시적 `id`를 넣는다.
 
 ```python
-class Test자동판정:
-    def test_공식_출처가_yes를_명시하면_yes로_자동_판정한다(self):
+class Test최종결과검토:
+    def test_공식_출처가_yes를_명시하면_yes를_승인한다(self):
         ...
 
 
@@ -199,8 +197,8 @@ testpaths = ["tests"]
 ## 단순성 원칙
 
 - 구현이 하나뿐인 추상화와 미래를 위한 빈 파일을 만들지 않는다.
-- FastAPI 라우트에 판정 정책을 직접 넣지 않는다.
-- Agent는 조사 결과를 만들고 결정론적 코드는 자동 정산 허용 여부를 결정한다.
+- FastAPI 라우트에 조사·검토 로직을 직접 넣지 않는다.
+- Agent는 조사 결과를 검토하고 필요하면 추가 조사한 뒤 최종 `YES`, `NO`, `ESCALATED`를 반환한다.
 - 파일은 책임을 이해하기 어려워졌을 때만 분리한다.
 - 외부 큐, 별도 워커, PostgreSQL, 다중 Agent는 실제 필요가 확인될 때 도입한다.
 - 입력 검증, 데이터 유실 방지, 보안, 금전 정산 테스트는 단순화를 이유로 생략하지 않는다.
