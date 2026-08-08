@@ -208,11 +208,9 @@ def finalize_investigation(
         )
 
     official_urls = {_normalize_url(url) for url in ctx.deps.official_sources}
-    if sum(
-        candidate.discovered_by != "MARKET_OFFICIAL_SOURCE"
-        or _normalize_url(candidate.url) not in official_urls
-        for candidate in search_candidates
-    ) > 5:
+    candidate_urls = {_normalize_url(candidate.url) for candidate in search_candidates}
+    search_candidate_urls = candidate_urls - official_urls
+    if len(search_candidate_urls) > 5:
         return _retry_or_escalate(
             ctx,
             summary,
@@ -265,13 +263,26 @@ def finalize_investigation(
             "제출한 검색어를 실제로 모두 실행해야 합니다.",
         )
 
-    candidate_urls = {_normalize_url(candidate.url) for candidate in search_candidates}
     if not candidate_urls <= trace.source_urls | official_urls:
         return _retry_or_escalate(
             ctx,
             summary,
             evidence,
             "검색 결과 또는 시장 지정 공식 URL에 없는 후보입니다.",
+        )
+
+    fetched_search_candidate_urls = (
+        trace.fetched_urls | trace.failed_fetch_urls
+    ) - official_urls
+    if (
+        len(fetched_search_candidate_urls) > 5
+        or fetched_search_candidate_urls != search_candidate_urls
+    ):
+        return _retry_or_escalate(
+            ctx,
+            summary,
+            evidence,
+            "실제 조회한 검색 후보는 제출 후보와 일치하는 고유 URL 최대 5개여야 합니다.",
         )
 
     evidence_urls = set(normalized_evidence_urls)

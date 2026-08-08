@@ -342,18 +342,53 @@ class Test조사지시문:
 
 
 class Test후보조회한도:
-    def test_검색으로_발견한_후보가_다섯개를_넘으면_보완_조사한다(self):
-        output = _공식_증거_출력("YES")
-        output["search_candidates"] = _검색_후보들(6)
+    def test_같은_검색_후보_url을_여섯번_제출해도_하나로_계산한다(self):
+        output = _고신뢰_증거_출력("YES", ["기관 A", "기관 B"])
+        first, second = output["search_candidates"]
+        output["search_candidates"] = [first.copy() for _ in range(6)] + [second]
 
         result, _, calls = _run_outputs(
-            _입력(),
-            [output, _공식_증거_출력("YES")],
+            _입력(official_sources=[]),
+            [output],
             message_history=_모든_후보_조사_기록(output),
         )
 
         assert result.decision == "YES"
-        assert calls == 2
+        assert calls == 1
+
+    def test_검색으로_발견한_후보가_다섯개를_넘으면_보완_조사한다(self):
+        output = _공식_증거_출력("YES")
+        output["search_candidates"] = _검색_후보들(7)
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [output] * 4,
+            message_history=_모든_후보_조사_기록(output),
+        )
+
+        assert result.decision == "ESCALATED"
+        assert calls == 4
+
+    def test_제출하지_않은_검색_후보_원문을_추가로_조회하면_이관한다(self):
+        output = _공식_증거_출력("YES")
+        history = _출력_조사_기록(output) + [
+            message
+            for index in range(6)
+            for message in _조사_기록(
+                query=_검색_계획()[0]["query"],
+                source_url=f"https://hidden-{index}.example/result",
+            )
+        ]
+
+        result, _, calls = _run_outputs(
+            _입력(),
+            [output] * 4,
+            message_history=history,
+        )
+
+        assert result.decision == "ESCALATED"
+        assert "후보" in (result.escalation_reason or "")
+        assert calls == 4
 
     def test_시장_지정_공식_후보는_다섯개_한도에서_제외한다(self):
         candidates = _검색_후보들(
@@ -392,12 +427,12 @@ class Test후보조회한도:
 
         result, _, calls = _run_outputs(
             _입력(),
-            [output, _공식_증거_출력("YES")],
+            [output] * 4,
             message_history=_모든_후보_조사_기록(output),
         )
 
-        assert result.decision == "YES"
-        assert calls == 2
+        assert result.decision == "ESCALATED"
+        assert calls == 4
 
 
 class Test자기검토:
