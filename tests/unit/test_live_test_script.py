@@ -33,6 +33,7 @@ def test_어느_디렉터리에서_실행해도_env와_live_시나리오를_지�
         str(저장소 / ".env"),
         "pytest",
         str(저장소 / "tests/live/resolver_live_scenarios.py"),
+        str(저장소 / "tests/live/manual_test_scenario.py"),
         "-v",
         "-s",
     ]
