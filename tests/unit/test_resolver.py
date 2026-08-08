@@ -1,11 +1,13 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+import httpx
 from pydantic_ai import models
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from oracle_agent.agents import resolver
 from oracle_agent.agents.resolver import _agent
 from oracle_agent.models import InvestigationInput, InvestigationResult
 
@@ -15,12 +17,16 @@ models.ALLOW_MODEL_REQUESTS = False
 Direction = Literal["YES", "NO"]
 
 
-def _입력(*, official_sources: list[str] | None = None) -> InvestigationInput:
+def _입력(
+    *,
+    official_sources: list[str] | None = None,
+    resolve_after: datetime | None = None,
+) -> InvestigationInput:
     return InvestigationInput(
         prediction_id="prediction-1",
         prediction="사건이 기준일까지 발생한다",
         resolution_criteria="공식 발표가 기준일까지 게시되면 YES, 아니면 NO",
-        resolve_after=datetime(2025, 1, 2, tzinfo=UTC),
+        resolve_after=resolve_after or datetime(2025, 1, 2, tzinfo=UTC),
         official_sources=(
             ["https://example.com/official/"] if official_sources is None else official_sources
         ),
@@ -203,3 +209,46 @@ class Test사람검토이관:
         assert result.decision == "ESCALATED"
         assert "충돌" in (result.escalation_reason or "")
         assert calls == 1
+
+
+class TestResolver실행:
+    def test_판정_가능_시점_전이면_모델을_호출하지_않고_이관한다(self, monkeypatch):
+        def 모델을_만들면_실패한다():
+            raise AssertionError("모델을 호출하면 안 됩니다")
+
+        monkeypatch.setattr(resolver, "_production_model", 모델을_만들면_실패한다)
+
+        result = asyncio.run(
+            resolver.resolve(
+                _입력(resolve_after=datetime.now(UTC) + timedelta(days=1)),
+            )
+        )
+
+        assert result.decision == "ESCALATED"
+        assert result.evidence == []
+        assert result.prediction_id == "prediction-1"
+
+
+def _http_status_error(response: httpx.Response) -> httpx.HTTPStatusError:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        return error
+    raise AssertionError("HTTP 오류 응답이 필요합니다")
+
+
+class TestProviderHttp재시도:
+    def test_timeout과_지정된_http_상태만_재시도한다(self):
+        timeout = httpx.ReadTimeout("timeout")
+        rate_limit = httpx.Response(
+            429,
+            request=httpx.Request("GET", "https://api.openai.com"),
+        )
+        bad_request = httpx.Response(
+            400,
+            request=httpx.Request("GET", "https://api.openai.com"),
+        )
+
+        assert resolver._is_retryable_http_error(timeout)
+        assert resolver._is_retryable_http_error(_http_status_error(rate_limit))
+        assert not resolver._is_retryable_http_error(_http_status_error(bad_request))

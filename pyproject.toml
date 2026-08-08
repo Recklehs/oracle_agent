@@ -9,7 +9,7 @@ description = "Prediction market resolution agent"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi",
-    "pydantic-ai",
+    "pydantic-ai[web-fetch]",
     "uvicorn",
 ]
 
