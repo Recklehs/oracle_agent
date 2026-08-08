@@ -57,17 +57,53 @@ def _출력(
     decision: Literal["YES", "NO", "ESCALATED"],
     evidence: list[dict[str, str]],
     *,
+    fitness: str = "FINAL",
     escalation_reason: str | None = None,
 ) -> dict[str, Any]:
     return {
         "decision": decision,
         "summary": f"조사 결과는 {decision}입니다.",
         "evidence": evidence,
+        "search_queries": _검색_계획(),
+        "search_candidates": [
+            {
+                "url": item["url"],
+                "title": item["title"],
+                "source_domain": "example.com",
+                "discovered_by": "MARKET_OFFICIAL_SOURCE",
+                "preliminary_authority": item["authority"],
+            }
+            for item in evidence
+        ],
+        "evidence_reviews": [
+            {
+                "url": item["url"],
+                "fitness": fitness,
+                "reason": "종료 조건을 확인했습니다.",
+            }
+            for item in evidence
+        ],
+        "self_review": {
+            "criteria_clear": True,
+            "result_period_complete": True,
+            "findings_match_sources": True,
+            "duplicate_publishers_checked": True,
+            "contradiction_search_complete": True,
+        },
         "escalation_reason": escalation_reason,
     }
 
 
-def _공식_증거_출력(direction: Direction) -> dict[str, Any]:
+def _검색_계획() -> list[dict[str, object]]:
+    return [
+        {"category": "OFFICIAL", "query": "사건 공식 결과", "target_domains": ["example.com"]},
+        {"category": "CURRENT", "query": "사건 기준일 최신 상태", "target_domains": []},
+        {"category": "SUPPORTS_YES", "query": "사건 발생 확인", "target_domains": []},
+        {"category": "SUPPORTS_NO", "query": "사건 미발생 반증", "target_domains": []},
+    ]
+
+
+def _공식_증거_출력(direction: Direction, *, fitness: str = "FINAL") -> dict[str, Any]:
     return _출력(
         direction,
         [
@@ -78,6 +114,7 @@ def _공식_증거_출력(direction: Direction) -> dict[str, Any]:
                 publisher="공식 기관",
             )
         ],
+        fitness=fitness,
     )
 
 
@@ -161,6 +198,50 @@ class Test자동판정승인:
 
         assert result.decision == "NO"
         assert calls == 1
+
+
+class Test검색계획검토:
+    def test_필수_검색_범주가_빠지면_보완_조사한다(self):
+        output = _공식_증거_출력("YES")
+        output["search_queries"] = output["search_queries"][:-1]
+
+        result, _, calls = _run_outputs(_입력(), [output, _공식_증거_출력("YES")])
+
+        assert result.decision == "YES"
+        assert calls == 2
+
+    def test_같은_검색어를_네_범주에_복사하면_보완_조사한다(self):
+        invalid = _공식_증거_출력("YES")
+        for query in invalid["search_queries"]:
+            query["query"] = "사건 결과"
+
+        result, _, calls = _run_outputs(_입력(), [invalid, _공식_증거_출력("YES")])
+
+        assert result.decision == "YES"
+        assert calls == 2
+
+
+class Test증거적합성검토:
+    def test_공식_출처라도_시점이_불명확하면_자동_승인하지_않는다(self):
+        stale = _공식_증거_출력("YES", fitness="STALE_OR_UNDATED")
+
+        result, _, calls = _run_outputs(_입력(), [stale] * 4)
+
+        assert result.decision == "ESCALATED"
+        assert "FINAL" in (result.escalation_reason or "")
+        assert calls == 4
+
+    @pytest.mark.parametrize(
+        "fitness",
+        ["PRELIMINARY", "FORECAST"],
+        ids=["PRELIMINARY", "FORECAST"],
+    )
+    def test_확정되지_않은_자료이면_자동_승인하지_않는다(self, fitness: str):
+        output = _공식_증거_출력("YES", fitness=fitness)
+
+        result, _, _ = _run_outputs(_입력(), [output] * 4)
+
+        assert result.decision == "ESCALATED"
 
 
 class Test추가조사:
