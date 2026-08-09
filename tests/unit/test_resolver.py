@@ -359,20 +359,21 @@ class Test후보조회한도:
         assert result.decision == "YES"
         assert calls == 1
 
-    def test_검색으로_발견한_후보가_다섯개를_넘으면_보완_조사한다(self):
+    def test_검색_후보_원문을_다섯개_넘게_조회했으면_재조사_없이_즉시_이관한다(self):
         output = _공식_증거_출력("YES")
         output["search_candidates"] = _검색_후보들(7)
 
         result, _, calls = _run_outputs(
             _입력(),
-            [output] * 4,
+            [output],
             message_history=_모든_후보_조사_기록(output),
         )
 
         assert result.decision == "ESCALATED"
-        assert calls == 4
+        assert "다섯 개" in (result.escalation_reason or "")
+        assert calls == 1
 
-    def test_제출하지_않은_검색_후보_원문을_추가로_조회하면_이관한다(self):
+    def test_제출하지_않은_검색_후보_원문을_추가로_조회하면_재조사_없이_이관한다(self):
         output = _공식_증거_출력("YES")
         history = _출력_조사_기록(output) + [
             message
@@ -385,13 +386,13 @@ class Test후보조회한도:
 
         result, _, calls = _run_outputs(
             _입력(),
-            [output] * 4,
+            [output],
             message_history=history,
         )
 
         assert result.decision == "ESCALATED"
         assert "후보" in (result.escalation_reason or "")
-        assert calls == 4
+        assert calls == 1
 
     def test_시장_지정_공식_후보는_다섯개_한도에서_제외한다(self):
         candidates = _검색_후보들(
@@ -430,12 +431,13 @@ class Test후보조회한도:
 
         result, _, calls = _run_outputs(
             _입력(),
-            [output] * 4,
+            [output],
             message_history=_모든_후보_조사_기록(output),
         )
 
         assert result.decision == "ESCALATED"
-        assert calls == 4
+        assert "다섯 개" in (result.escalation_reason or "")
+        assert calls == 1
 
 
 class Test자기검토:
@@ -603,6 +605,46 @@ class Test사람검토이관:
             [conflict, recovered],
             message_history=_출력_조사_기록(conflict),
         )
+
+        assert result.decision == "ESCALATED"
+        assert "충돌" in (result.escalation_reason or "")
+        assert calls == 1
+
+    @pytest.mark.parametrize(
+        "fitness",
+        ["STALE_OR_UNDATED", "INCONCLUSIVE", "FORECAST"],
+        ids=["낡은_자료", "확인_실패", "예상치"],
+    )
+    def test_확정되지_않은_적합성의_반대증거는_충돌로_보지_않는다(self, fitness: str):
+        output = _출력(
+            "NO",
+            [
+                _증거(
+                    "NO",
+                    url="https://no.example/result",
+                    authority="official",
+                    publisher="확정 공식 기관",
+                ),
+                _증거(
+                    "YES",
+                    url="https://yes.example/stale-profile",
+                    authority="official",
+                    publisher="미확정 공식 자료",
+                ),
+            ],
+        )
+        output["evidence_reviews"][1]["fitness"] = fitness
+
+        result, _, calls = _run_outputs(_입력(official_sources=[]), [output])
+
+        assert result.decision == "NO"
+        assert calls == 1
+
+    def test_preliminary_적합성의_반대증거와_충돌하면_이관한다(self):
+        output = _충돌_증거_출력()
+        output["evidence_reviews"][1]["fitness"] = "PRELIMINARY"
+
+        result, _, calls = _run_outputs(_입력(official_sources=[]), [output])
 
         assert result.decision == "ESCALATED"
         assert "충돌" in (result.escalation_reason or "")
@@ -879,7 +921,7 @@ class Test조사실행기록:
         assert result.decision == "YES"
         assert calls == 1
 
-    def test_native_검색결과의_url이_잘못되어도_예외없이_이관한다(self):
+    def test_native_검색결과의_url이_잘못되면_예외없이_즉시_이관한다(self):
         output = _공식_증거_출력("YES")
         history = [
             message
@@ -893,13 +935,13 @@ class Test조사실행기록:
 
         result, _, calls = _run_outputs(
             _입력(),
-            [output] * 4,
+            [output],
             message_history=history,
         )
 
         assert result.decision == "ESCALATED"
         assert "실행 기록" in (result.escalation_reason or "")
-        assert calls == 4
+        assert calls == 1
 
     def test_연결되지_않은_native_검색반환의_후보는_보완_조사한다(self):
         output = _고신뢰_증거_출력("YES", ["기관 A", "기관 B"])
@@ -958,7 +1000,7 @@ class TestResolver실행:
         assert result.decision == "ESCALATED"
         assert "검색어" in (result.escalation_reason or "")
 
-    def test_중복을_제외한_공식_url이_여섯개이면_도구호출한도를_열다섯으로_늘린다(
+    def test_중복을_제외한_공식_url이_여섯개이면_도구호출한도를_스물셋으로_늘린다(
         self,
         monkeypatch,
     ):
@@ -990,7 +1032,7 @@ class TestResolver실행:
         asyncio.run(resolver.resolve(_입력(official_sources=sources)))
 
         assert captured_limits is not None
-        assert captured_limits.tool_calls_limit == 15
+        assert captured_limits.tool_calls_limit == 23
 
 
 class Test도구재시도:
@@ -1029,12 +1071,154 @@ class Test웹조회실패:
             raise ModelRetry("페이지에 접근할 수 없습니다")
 
         monkeypatch.setattr(resolver._raw_web_fetch_tool, "function", always_fails)
+        ctx = SimpleNamespace(
+            messages=[],
+            deps=_입력(official_sources=["https://unavailable.example"]),
+        )
 
-        result = asyncio.run(resolver._fetch_web_page("https://unavailable.example"))
+        result = asyncio.run(
+            resolver._fetch_web_page(ctx, "https://unavailable.example")
+        )
 
         assert result["url"] == "https://unavailable.example"
         assert "접근할 수 없습니다" in result["error"]
         assert attempts == 3
+
+    def test_조회_규칙을_위반한_fetch는_조회_없이_skipped를_반환한다(self):
+        ctx = SimpleNamespace(messages=[], deps=_입력(official_sources=[]))
+
+        result = asyncio.run(
+            resolver._fetch_web_page(ctx, "https://unknown.example/page")
+        )
+
+        assert result["url"] == "https://unknown.example/page"
+        assert "skipped" in result
+
+
+class Test검색후보조회차단:
+    def test_검색_결과에_없는_주소_조회를_거절한다(self):
+        messages = _조사_기록(
+            query="사건 공식 결과", source_url="https://a.example/result"
+        )
+
+        refusal = resolver._search_fetch_refusal(
+            messages, [], "https://b.example/other"
+        )
+
+        assert refusal is not None
+        assert "검색 결과" in refusal
+
+    def test_시장_지정_공식_url은_검색_결과에_없어도_조회를_허용한다(self):
+        refusal = resolver._search_fetch_refusal(
+            [], ["https://official.example/page"], "https://official.example/page/"
+        )
+
+        assert refusal is None
+
+    def test_여섯번째_검색_후보_조회를_거절한다(self):
+        histories = [
+            _조사_기록(
+                query=f"질의 {index}",
+                source_url=f"https://candidate-{index}.example/result",
+            )
+            for index in range(5)
+        ]
+        histories.append(
+            _조사_기록(
+                query="질의 6",
+                source_url="https://candidate-6.example/result",
+                fetch=False,
+            )
+        )
+        messages = [message for history in histories for message in history]
+
+        refusal = resolver._search_fetch_refusal(
+            messages, [], "https://candidate-6.example/result"
+        )
+
+        assert refusal is not None
+        assert "최대 5개" in refusal
+
+    def test_응답을_기다리는_병렬_조회도_한도에_포함해_거절한다(self):
+        histories = [
+            _조사_기록(
+                query=f"질의 {index}",
+                source_url=f"https://candidate-{index}.example/result",
+            )
+            for index in range(4)
+        ]
+        histories += [
+            _조사_기록(
+                query=f"질의 {index}",
+                source_url=f"https://candidate-{index}.example/result",
+                fetch=False,
+            )
+            for index in range(4, 6)
+        ]
+        messages = [message for history in histories for message in history]
+        messages.append(
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="web_fetch",
+                        tool_call_id=f"fetch-parallel-{index}",
+                        args={"url": f"https://candidate-{index}.example/result"},
+                    )
+                    for index in range(4, 6)
+                ]
+            )
+        )
+
+        refusal = resolver._search_fetch_refusal(
+            messages, [], "https://candidate-5.example/result"
+        )
+
+        assert refusal is not None
+        assert "최대 5개" in refusal
+
+    def test_이미_조회한_검색_후보는_다시_조회를_허용한다(self):
+        messages = [
+            message
+            for index in range(5)
+            for message in _조사_기록(
+                query=f"질의 {index}",
+                source_url=f"https://candidate-{index}.example/result",
+            )
+        ]
+
+        refusal = resolver._search_fetch_refusal(
+            messages, [], "https://candidate-0.example/result"
+        )
+
+        assert refusal is None
+
+    def test_skipped_반환은_조회_기록에_남지_않는다(self):
+        url = "https://skipped.example/result"
+        messages = [
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="web_fetch",
+                        tool_call_id="fetch-skip",
+                        args={"url": url},
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="web_fetch",
+                        tool_call_id="fetch-skip",
+                        content={"url": url, "skipped": "조회 한도 초과"},
+                    )
+                ]
+            ),
+        ]
+
+        trace = resolver._extract_investigation_trace(messages)
+
+        assert trace.fetched_urls == set()
+        assert trace.failed_fetch_urls == set()
 
 
 def _http_status_error(response: httpx.Response) -> httpx.HTTPStatusError:
@@ -1053,13 +1237,13 @@ def _재시도_상태(response: httpx.Response) -> RetryCallState:
 
 
 class Test조사실행관찰:
-    def test_관찰용_잘못된_조사기록이_구조화된_출력의_보완조사를_막지_않는다(self):
+    def test_정규화할_수_없는_조사기록이_있으면_출력_보완보다_먼저_즉시_이관한다(self):
         output = _공식_증거_출력("YES")
         output["search_queries"] = output["search_queries"][:-1]
 
         result, _, calls = _run_outputs(
             _입력(),
-            [output] * 4,
+            [output],
             message_history=_조사_기록(
                 query="사건 공식 결과",
                 source_url="https://search.example:invalid/result",
@@ -1067,8 +1251,8 @@ class Test조사실행관찰:
         )
 
         assert result.decision == "ESCALATED"
-        assert "필수 검색 범주" in (result.escalation_reason or "")
-        assert calls == 4
+        assert "실행 기록" in (result.escalation_reason or "")
+        assert calls == 1
 
     def test_provider_재시도전에_상태와_대기시간을_기록한다(self, caplog):
         state = _재시도_상태(
@@ -1114,7 +1298,7 @@ class TestProviderHttp재시도:
         assert resolver._is_retryable_http_error(_http_status_error(rate_limit))
         assert not resolver._is_retryable_http_error(_http_status_error(bad_request))
 
-    def test_재시도_가능한_http_오류는_최초_포함_세번_시도한다(self):
+    def test_재시도_가능한_http_오류는_최초_포함_여섯번_시도한다(self):
         attempts = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1134,4 +1318,4 @@ class TestProviderHttp재시도:
 
         asyncio.run(request())
 
-        assert attempts == 3
+        assert attempts == 6
