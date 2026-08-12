@@ -10,7 +10,7 @@ Oracle Agent는 prediction market의 YES/NO 이진 시장을 종료할 때 현�
 
 MVP의 최우선 기준은 자동 처리율이 아니라 잘못된 자동 판정을 최소화하는 것이다.
 
-전체 서비스 설계는 `docs/superpowers/specs/2026-08-06-oracle-agent-architecture-design.md`를 참고한다. Agent의 조사·검토 흐름과 DTO는 `docs/superpowers/specs/2026-08-08-agent-investigation-dtos-design.md`를 우선한다.
+전체 서비스 설계는 `docs/superpowers/specs/2026-08-06-oracle-agent-architecture-design.md`를 참고한다. Agent의 조사·검토 흐름과 DTO는 `docs/superpowers/specs/2026-08-08-agent-investigation-dtos-design.md`를 우선한다. 조사 Agent와 판정 Agent의 분리, 교체형 검색 backend는 `docs/superpowers/specs/2026-08-09-pluggable-search-agent-design.md`를 우선한다.
 
 ## MVP 범위
 
@@ -74,39 +74,54 @@ src/oracle_agent/
 ├── db.py
 └── agents/
     ├── __init__.py
-    ├── resolver.py
-    ├── tools.py
-    └── hooks.py       # 실제 Hook이 생길 때만 생성
+    ├── provider.py         # 공용 HTTP retry transport와 production 모델 factory
+    ├── search_backends.py  # 교체형 검색 backend와 선택 registry
+    ├── searcher.py         # 조사 Agent: 검색 계획→검색→후보→원문 조회→EvidenceBundle
+    ├── resolver.py         # 판정 Agent와 resolve() orchestration
+    └── hooks.py            # 실제 Hook이 생길 때만 생성
 
 tests/
 ├── unit/
+│   ├── test_provider.py
+│   ├── test_search_backends.py
+│   ├── test_searcher.py
 │   ├── test_resolver.py
 │   └── test_models.py
 └── integration/
     └── test_api.py
 
 tests/live/
-└── resolver_live_scenarios.py  # 명시적 opt-in으로만 실행
+├── resolver_live_scenarios.py        # 명시적 opt-in으로만 실행
+└── search_backend_live_scenarios.py  # 검색 backend만 따로 비교 검증
 ```
 
 - `app.py`: FastAPI 라우트, lifespan, 인프로세스 작업 루프, Agent 결과 저장과 Webhook 전달
 - `models.py`: 요청, 작업, 증거, 조사 결과, 판정 결과의 Pydantic 모델과 enum
 - `db.py`: SQLite 연결, 스키마 초기화, 작업 저장·선점·조회·상태 변경
-- `agents/resolver.py`: 재사용 가능한 Pydantic AI Agent, 조사·검토·추가 조사 흐름, 지시문, 코드 소유 필드를 붙이는 output function
-- `agents/tools.py`: 웹 검색과 페이지 조회 등 Agent 도구
+- `agents/provider.py`: 모델 provider와 검색 backend가 공유하는 HTTP 재시도, production 모델 구성
+- `agents/search_backends.py`: `SearchBackend` protocol, openai·gemini·exa 구현, `ORACLE_SEARCH_BACKEND` 기반 선택
+- `agents/searcher.py`: 검색으로 근거를 수집하는 조사 Agent, 코드 소유 `SearchTrace`, 조사 안전 gate
+- `agents/resolver.py`: `EvidenceBundle`을 검토해 판정하는 Agent, 판정 안전 gate, `resolve()` orchestration
 - `agents/hooks.py`: 로깅·측정 등 실제 Hook이 필요할 때만 생성
 
-프롬프트는 우선 `resolver.py`에 둔다. 여러 Agent가 공유하거나 파일 가독성을 해칠 만큼 길어질 때만 분리한다.
+프롬프트는 각 Agent 파일에 둔다. 여러 Agent가 공유하거나 파일 가독성을 해칠 만큼 길어질 때만 분리한다.
+
+검색 backend는 환경 변수로 선택한다.
+
+- `ORACLE_SEARCH_BACKEND`: `openai`(기본), `gemini`, `exa`, `tavily`, `brave`
+- `gemini`는 `GEMINI_API_KEY`, `exa`는 `EXA_API_KEY`, `tavily`는 `TAVILY_API_KEY`, `brave`는 `BRAVE_API_KEY`가 필요하다.
+- `ORACLE_OPENAI_SEARCH_MODEL`, `ORACLE_GEMINI_SEARCH_MODEL`로 검색 전용 모델을 바꿀 수 있다.
+- 테스트·실험에서는 `resolve(..., search_backend=...)`로 직접 주입할 수 있다.
 
 ## 판정 작업 흐름
 
 1. `POST /v1/resolution-jobs`가 요청을 검증한다.
 2. 작업을 SQLite에 `queued`로 저장하고 `202 Accepted`, `job_id`, `status_url`을 반환한다.
 3. FastAPI lifespan에서 시작된 비동기 작업 루프가 작업을 원자적으로 선점해 `running`으로 바꾼다.
-4. Pydantic AI Agent가 공식 출처를 우선 조사하고 필요하면 추가 출처를 찾아 구조화된 조사 결과 초안을 만든다.
-5. Agent가 초안의 근거와 결론을 검토한다.
-6. 검토에서 문제가 발견되면 검토 의견을 반영해 최대 3회 추가 조사한다.
-7. output function이 입력의 `prediction_id`를 붙이고 최종 `YES`, `NO`, `ESCALATED`와 구조화된 증거를 반환한다.
+4. 조사 Agent가 공식 출처를 우선 조사하고 설정된 검색 backend로 추가 출처를 찾아 구조화된 조사 번들을 만든다.
+5. 조사 gate가 검색·원문 조회 실행 기록과 제출값을 대조하고 부족하면 최대 3회 보완 조사한다.
+6. 판정 Agent가 조사 번들을 검토해 최종 판정을 제출한다.
+7. 판정 gate가 자동 판정 안전 조건을 검사하고 입력의 `prediction_id`와 번들 증거를 붙여 최종 `YES`, `NO`, `ESCALATED`를 반환한다.
 8. 결과를 `resolved`, `escalated`, `failed` 중 하나로 저장한다.
 9. 저장 후 완료 또는 이관 Webhook을 전달한다.
 
@@ -161,7 +176,7 @@ MVP는 단일 Uvicorn 프로세스로 실행한다. 서버 시작 시 이전 프
 - `ALLOW_MODEL_REQUESTS=False`로 기본 테스트의 실제 모델 호출을 차단한다.
 - 외부 검색과 Webhook만 `monkeypatch`로 대체한다.
 - 실제 LLM과 인터넷을 호출하는 검증은 기본 테스트에 넣지 않는다.
-- 실제 LLM과 인터넷을 호출하는 시나리오는 `tests/live/resolver_live_scenarios.py`에 둔다. 파일명이 pytest 기본 수집 패턴과 다르므로 전체 테스트에 포함되지 않으며, `RUN_ORACLE_LIVE_TESTS=1`과 파일 경로를 함께 지정한 수동 명령으로만 실행한다. 로컬 API 키는 Git이 무시하는 `.env`의 `OPENAI_API_KEY`에 사용자가 직접 넣고 `uv run --env-file .env`로 읽는다.
+- 실제 LLM과 인터넷을 호출하는 시나리오는 `tests/live/resolver_live_scenarios.py`에 둔다. 파일명이 pytest 기본 수집 패턴과 다르므로 전체 테스트에 포함되지 않으며, `RUN_ORACLE_LIVE_TESTS=1`과 파일 경로를 함께 지정한 수동 명령으로만 실행한다. 로컬 API 키는 Git이 무시하는 `.env`의 `OPENAI_API_KEY`(다른 검색 backend를 실험할 때는 `GEMINI_API_KEY`, `EXA_API_KEY`, `TAVILY_API_KEY`, `BRAVE_API_KEY`)에 사용자가 직접 넣고 `uv run --env-file .env`로 읽는다.
 
 테스트 실패 node ID만 보고도 행동과 기대 결과를 한국어로 이해할 수 있어야 한다.
 
