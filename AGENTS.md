@@ -108,8 +108,8 @@ tests/live/
 
 검색 backend는 환경 변수로 선택한다.
 
-- `ORACLE_SEARCH_BACKEND`: `openai`(기본), `gemini`, `exa`, `tavily`, `brave`
-- `gemini`는 `GEMINI_API_KEY`, `exa`는 `EXA_API_KEY`, `tavily`는 `TAVILY_API_KEY`, `brave`는 `BRAVE_API_KEY`가 필요하다.
+- `ORACLE_SEARCH_BACKEND`: `openai`(기본), `gemini`, `exa`, `tavily` (`brave`는 키 발급 문제로 registry에서 임시 비활성)
+- `gemini`는 `GEMINI_API_KEY`, `exa`는 `EXA_API_KEY`, `tavily`는 `TAVILY_API_KEY`가 필요하다.
 - `ORACLE_OPENAI_SEARCH_MODEL`, `ORACLE_GEMINI_SEARCH_MODEL`로 검색 전용 모델을 바꿀 수 있다.
 - 테스트·실험에서는 `resolve(..., search_backend=...)`로 직접 주입할 수 있다.
 

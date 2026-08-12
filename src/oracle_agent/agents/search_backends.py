@@ -20,7 +20,7 @@ from oracle_agent.models import NonEmptyText
 
 MAX_RESULTS_PER_SEARCH = 8
 DEFAULT_OPENAI_SEARCH_MODEL = "gpt-5.6-luna"
-DEFAULT_GEMINI_SEARCH_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_SEARCH_MODEL = "gemini-3.5-flash-lite"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 EXA_SEARCH_URL = "https://api.exa.ai/search"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -335,7 +335,8 @@ BACKEND_FACTORIES: dict[str, type] = {
     GeminiGroundingBackend.name: GeminiGroundingBackend,
     ExaSearchBackend.name: ExaSearchBackend,
     TavilySearchBackend.name: TavilySearchBackend,
-    BraveSearchBackend.name: BraveSearchBackend,
+    # BRAVE_API_KEY 발급 실패로 임시 비활성. 키 확보 후 주석 해제.
+    # BraveSearchBackend.name: BraveSearchBackend,
 }
 
 

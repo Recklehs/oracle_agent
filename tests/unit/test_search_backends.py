@@ -43,9 +43,10 @@ class Test백엔드선택:
             ("gemini", "GEMINI_API_KEY"),
             ("exa", "EXA_API_KEY"),
             ("tavily", "TAVILY_API_KEY"),
-            ("brave", "BRAVE_API_KEY"),
+            # brave는 registry에서 임시 비활성이라 키 검사 전에 거절된다.
+            # ("brave", "BRAVE_API_KEY"),
         ],
-        ids=["gemini", "exa", "tavily", "brave"],
+        ids=["gemini", "exa", "tavily"],
     )
     def test_api_키가_없으면_구체적으로_실패한다(
         self, monkeypatch, backend_name: str, env_key: str
@@ -54,6 +55,12 @@ class Test백엔드선택:
 
         with pytest.raises(ValueError, match=env_key):
             create_search_backend(backend_name)
+
+    def test_임시_비활성인_brave는_거절한다(self, monkeypatch):
+        monkeypatch.setenv("BRAVE_API_KEY", "brave-key")
+
+        with pytest.raises(ValueError, match="지원하지 않는"):
+            create_search_backend("brave")
 
 
 class TestHttp오류전파:

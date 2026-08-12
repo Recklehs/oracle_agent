@@ -7,7 +7,7 @@ span과 raw HTTP 요청·응답이 기록된다.
 
 1. Git이 무시하는 `.env`에 사용할 backend의 API 키를 넣는다.
    - openai: `OPENAI_API_KEY`, gemini: `GEMINI_API_KEY`, exa: `EXA_API_KEY`,
-     tavily: `TAVILY_API_KEY`, brave: `BRAVE_API_KEY`
+     tavily: `TAVILY_API_KEY` (brave는 키 발급 문제로 임시 비활성)
    - 키가 없는 backend는 실패가 아니라 skip으로 표시된다.
 2. 다음 스크립트로 이 파일만 명시적으로 실행한다.
 
@@ -49,9 +49,10 @@ BACKEND_KEY_ENV = {
     "gemini": "GEMINI_API_KEY",
     "exa": "EXA_API_KEY",
     "tavily": "TAVILY_API_KEY",
-    "brave": "BRAVE_API_KEY",
+    # brave는 registry에서 임시 비활성이라 비교 대상에서 제외한다.
+    # "brave": "BRAVE_API_KEY",
 }
-# Brave 무료 요금제가 초당 1회 제한이므로 검색 사이에 짧게 대기한다.
+# 무료 요금제 backend의 초당 요청 제한을 피하려고 검색 사이에 짧게 대기한다.
 SECONDS_BETWEEN_SEARCHES = 1.5
 REPORT_DIR = Path(__file__).parent / "report"
 
