@@ -1076,6 +1076,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "httpx" },
+    { name = "logfire" },
     { name = "pytest" },
 ]
 
@@ -1089,6 +1090,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "httpx" },
+    { name = "logfire", specifier = ">=4.40.0" },
     { name = "pytest" },
 ]
 

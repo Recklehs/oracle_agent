@@ -7,11 +7,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import logfire
 import pytest
 
 
+# .env의 LOGFIRE_TOKEN이 있을 때만 trace를 전송하므로 토큰 없는 실행에는 영향이 없다.
+logfire.configure(
+    service_name="oracle-agent",
+    environment="manual-live-test",
+    send_to_logfire="if-token-present",
+)
+logfire.instrument_pydantic_ai()
+# web_fetch 원문과 검색 backend의 raw 응답까지 본문째 기록한다. 디버깅이 끝나면 끈다.
+logfire.instrument_httpx(capture_all=True)
+
+
 REPORT_DIR = Path(__file__).parent / "report"
-RESOLVER_LOGGER = "oracle_agent.agents.resolver"
+# 조사·판정 Agent가 각각 남기는 `agent usage` 로그를 패키지 로거에서 함께 수집한다.
+AGENTS_LOGGER = "oracle_agent.agents"
 SECONDS_BETWEEN_TESTS = 30
 
 _entries: list[dict[str, Any]] = []
@@ -30,7 +43,7 @@ def _scenario_label(name: str) -> str:
 
 
 class _UsageCollector(logging.Handler):
-    """resolver의 `agent usage` 로그에서 사용량 수치를 수집한다."""
+    """Agent들의 `agent usage` 로그에서 사용량 수치를 수집한다."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.INFO)
@@ -54,9 +67,14 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
 
 @pytest.fixture(autouse=True)
 def _agent_usage_report(request: pytest.FixtureRequest):
+    # 검색 backend 단독 시나리오는 Agent 사용량이 없으므로 테스트 간 대기와
+    # 사용량 수집을 건너뛴다. 속도 조절은 해당 모듈이 직접 한다.
+    if request.node.path.name == "search_backend_live_scenarios.py":
+        yield
+        return
     if _entries:
         time.sleep(SECONDS_BETWEEN_TESTS)
-    logger = logging.getLogger(RESOLVER_LOGGER)
+    logger = logging.getLogger(AGENTS_LOGGER)
     collector = _UsageCollector()
     original_level = logger.level
     if not logger.isEnabledFor(logging.INFO):
