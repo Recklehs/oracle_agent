@@ -7,3 +7,5 @@ __pycache__/
 *.db
 *.sqlite3
 tests/live/report/
+docs/
+.DS_Store
