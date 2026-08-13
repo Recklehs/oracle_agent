@@ -12,6 +12,7 @@ from tenacity import RetryCallState, retry_if_exception, stop_after_attempt, wai
 
 
 PRODUCTION_MODEL_NAME = "gpt-5.6-luna"
+JUDGE_MODEL_NAME = "gpt-5.6-terra"
 RETRYABLE_HTTP_STATUSES = {429, 502, 503, 504}
 logger = logging.getLogger(__name__)
 
@@ -68,10 +69,27 @@ def retrying_async_client(timeout: float = 60) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=retrying_transport(), timeout=timeout)
 
 
-@cache
-def production_model() -> OpenAIResponsesModel:
+def _build_model(model_name: str) -> OpenAIResponsesModel:
     openai_client = AsyncOpenAI(http_client=retrying_async_client(), max_retries=0)
     return OpenAIResponsesModel(
-        PRODUCTION_MODEL_NAME,
+        model_name,
         provider=OpenAIProvider(openai_client=openai_client),
     )
+
+
+@cache
+def production_model() -> OpenAIResponsesModel:
+    return _build_model(PRODUCTION_MODEL_NAME)
+
+
+@cache
+def judge_model() -> OpenAIResponsesModel:
+    return _build_model(JUDGE_MODEL_NAME)
+
+
+async def aclose_cached_models() -> None:
+    """캐시된 모델의 HTTP 클라이언트를 닫고 캐시를 비운다."""
+    for factory in (production_model, judge_model):
+        if factory.cache_info().currsize:
+            await factory().client.close()
+        factory.cache_clear()

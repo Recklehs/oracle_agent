@@ -21,7 +21,7 @@ if os.getenv("RUN_ORACLE_LIVE_TESTS") != "1":
 if not os.getenv("OPENAI_API_KEY"):
     pytest.skip(".env의 OPENAI_API_KEY가 필요합니다", allow_module_level=True)
 
-from oracle_agent.agents.provider import production_model
+from oracle_agent.agents.provider import aclose_cached_models
 from oracle_agent.agents.resolver import resolve
 from oracle_agent.models import InvestigationInput
 
@@ -69,7 +69,7 @@ async def _resolve_and_close(investigation: InvestigationInput):
     try:
         return await resolve(investigation)
     finally:
-        await production_model().client.close()
+        await aclose_cached_models()
 
 
 @pytest.mark.parametrize(
@@ -88,10 +88,7 @@ def test_실제_luna가_과거_사건을_조사해_기대_결론을_낸다(
     investigation: InvestigationInput,
     expected: str,
 ):
-    try:
-        result = asyncio.run(_resolve_and_close(investigation))
-    finally:
-        production_model.cache_clear()
+    result = asyncio.run(_resolve_and_close(investigation))
 
     print(result.model_dump_json(indent=2))
     assert result.decision == expected

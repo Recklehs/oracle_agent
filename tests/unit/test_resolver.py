@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -6,18 +7,22 @@ from typing import Any, Literal
 
 import pytest
 from pydantic_ai import models
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from oracle_agent.agents import resolver
 from oracle_agent.agents.resolver import JudgeDeps, _agent
-from oracle_agent.agents.searcher import EvidenceBundle, EvidenceFitness
+from oracle_agent.agents.searcher import EvidenceBundle
 from oracle_agent.models import InvestigationInput, InvestigationResult
 
 
 models.ALLOW_MODEL_REQUESTS = False
 
 Direction = Literal["YES", "NO"]
+
+# FunctionModel은 기본적으로 native structured output을 지원하지 않는다고 표시되므로
+# 판정 Agent와 같은 출력 방식으로 테스트하도록 profile을 켠다.
+NATIVE_OUTPUT_PROFILE = {"supports_json_schema_output": True}
 
 
 def _입력(
@@ -42,34 +47,23 @@ def _증거(
     url: str,
     authority: Literal["official", "high_trust", "other"],
     publisher: str,
-    original_publisher: str | None = None,
 ) -> dict[str, str]:
     return {
         "url": url,
         "title": f"{publisher} 발표",
         "publisher": publisher,
-        "original_publisher": original_publisher or publisher,
+        "original_publisher": publisher,
         "authority": authority,
         "supports": direction,
         "finding": f"{direction}를 지지하는 사실을 확인했습니다.",
     }
 
 
-def _번들(
-    evidence: list[dict[str, str]],
-    *,
-    fitness: str = "FINAL",
-    self_review: dict[str, Any] | None = None,
-) -> EvidenceBundle:
+def _번들(evidence: list[dict[str, str]]) -> EvidenceBundle:
     return EvidenceBundle.model_validate(
         {
             "summary": "조사 결과를 요약했습니다.",
-            "search_queries": [
-                {"category": "OFFICIAL", "query": "사건 공식 결과"},
-                {"category": "CURRENT", "query": "사건 기준일 최신 상태"},
-                {"category": "SUPPORTS_YES", "query": "사건 발생 확인"},
-                {"category": "SUPPORTS_NO", "query": "사건 미발생 반증"},
-            ],
+            "search_queries": [{"query": "사건 공식 결과"}],
             "search_candidates": [
                 {
                     "url": item["url"],
@@ -84,13 +78,12 @@ def _번들(
             "evidence_reviews": [
                 {
                     "url": item["url"],
-                    "fitness": fitness,
+                    "fitness": "FINAL",
                     "reason": "종료 조건을 확인했습니다.",
                 }
                 for item in evidence
             ],
-            "self_review": self_review
-            or {
+            "self_review": {
                 "criteria_clear": True,
                 "result_period_complete": True,
                 "findings_match_sources": True,
@@ -101,7 +94,7 @@ def _번들(
     )
 
 
-def _공식_증거_번들(direction: Direction, **kwargs: Any) -> EvidenceBundle:
+def _공식_증거_번들(direction: Direction) -> EvidenceBundle:
     return _번들(
         [
             _증거(
@@ -110,53 +103,22 @@ def _공식_증거_번들(direction: Direction, **kwargs: Any) -> EvidenceBundle
                 authority="official",
                 publisher="공식 기관",
             )
-        ],
-        **kwargs,
-    )
-
-
-def _고신뢰_증거_번들(direction: Direction, publishers: list[str]) -> EvidenceBundle:
-    return _번들(
-        [
-            _증거(
-                direction,
-                url=f"https://source-{index}.example/report",
-                authority="high_trust",
-                publisher=f"보도사 {index}",
-                original_publisher=publisher,
-            )
-            for index, publisher in enumerate(publishers, start=1)
         ]
     )
 
 
-def _충돌_증거_번들() -> EvidenceBundle:
-    return _번들(
-        [
-            _증거(
-                "YES",
-                url="https://yes.example/result",
-                authority="official",
-                publisher="YES 공식 기관",
-            ),
-            _증거(
-                "NO",
-                url="https://no.example/result",
-                authority="high_trust",
-                publisher="NO 고신뢰 기관",
-            ),
-        ]
-    )
-
-
-def _판정(
+def _결과(
+    bundle: EvidenceBundle,
     decision: Literal["YES", "NO", "ESCALATED"],
     *,
     reason: str | None = None,
 ) -> dict[str, Any]:
+    """판정 Agent가 native structured output으로 반환할 결과 DTO payload."""
     return {
+        "prediction_id": "prediction-1",
         "decision": decision,
         "summary": f"조사 결과는 {decision}입니다.",
+        "evidence": [dict(item) for item in bundle.model_dump(mode="json")["evidence"]],
         "escalation_reason": reason,
     }
 
@@ -165,240 +127,99 @@ def _판정_실행(
     investigation: InvestigationInput,
     bundle: EvidenceBundle,
     outputs: list[dict[str, Any]],
-) -> tuple[InvestigationResult, list[dict[str, Any]], int]:
-    schemas: list[dict[str, Any]] = []
+) -> tuple[InvestigationResult, list[str], int]:
+    instructions: list[str] = []
     calls = 0
 
-    def model_function(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+    def model_function(messages: list[Any], info: AgentInfo) -> ModelResponse:
         nonlocal calls
-        schemas.append(info.output_tools[0].parameters_json_schema)
+        instructions.append(info.instructions or "")
         output = outputs[min(calls, len(outputs) - 1)]
         calls += 1
-        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, output)])
+        return ModelResponse(parts=[TextPart(json.dumps(output))])
 
-    with _agent.override(model=FunctionModel(model_function)):
+    with _agent.override(
+        model=FunctionModel(model_function, profile=NATIVE_OUTPUT_PROFILE)
+    ):
         result = asyncio.run(
             _agent.run(
                 "판정을 제출하세요.",
                 deps=JudgeDeps(investigation=investigation, bundle=bundle),
             )
         )
-    return result.output, schemas, calls
+    return result.output, instructions, calls
 
 
-class Test판정출력경계:
-    def test_모델은_증거를_제출할_수_없고_결과에는_번들_증거를_붙인다(self):
+class Test판정컨텍스트:
+    def test_판정_컨텍스트에_입력과_번들을_넣고_resolve_after는_제외한다(self):
         bundle = _공식_증거_번들("YES")
-        result, schemas, _ = _판정_실행(_입력(), bundle, [_판정("YES")])
+        _, instructions, _ = _판정_실행(_입력(), bundle, [_결과(bundle, "YES")])
 
-        assert "evidence" not in schemas[0]["properties"]
-        assert "prediction_id" not in schemas[0]["properties"]
-        assert result.prediction_id == "prediction-1"
-        assert result.evidence == bundle.evidence
+        assert "prediction-1" in instructions[0]
+        assert "사건이 기준일까지 발생한다" in instructions[0]
+        assert "조사 Agent의 증거 번들" in instructions[0]
+        assert "resolve_after" not in instructions[0]
+        assert "2025-01-02" not in instructions[0]
+
+    def test_종합_검토와_이관_우선_지침이_프롬프트에_포함된다(self):
+        bundle = _공식_증거_번들("YES")
+        _, instructions, _ = _판정_실행(_입력(), bundle, [_결과(bundle, "YES")])
+
+        assert "종합적으로 검토" in instructions[0]
+        assert "잘못된 자동 판정보다\nESCALATED를 우선한다" in instructions[0]
+        assert "그대로 복사" in instructions[0]
 
 
-class Test자동판정승인:
-    def test_공식_출처가_yes를_명시하면_yes를_승인한다(self):
-        result, _, calls = _판정_실행(_입력(), _공식_증거_번들("YES"), [_판정("YES")])
+class Test판정출력검증:
+    def test_모델이_결과_dto_양식으로_제출하면_그대로_반환한다(self):
+        bundle = _공식_증거_번들("YES")
+        result, _, calls = _판정_실행(_입력(), bundle, [_결과(bundle, "YES")])
 
         assert result.decision == "YES"
+        assert result.evidence == bundle.evidence
+        assert result.escalation_reason is None
         assert calls == 1
 
-    def test_독립적인_고신뢰_원출처_두개가_no를_지지하면_no를_승인한다(self):
-        result, _, calls = _판정_실행(
-            _입력(official_sources=[]),
-            _고신뢰_증거_번들("NO", ["기관 A", "기관 B"]),
-            [_판정("NO")],
-        )
-
-        assert result.decision == "NO"
-        assert calls == 1
-
-
-class Test자기검토:
-    @pytest.mark.parametrize(
-        "field",
-        [
-            "criteria_clear",
-            "result_period_complete",
-            "findings_match_sources",
-            "duplicate_publishers_checked",
-            "contradiction_search_complete",
-        ],
-        ids=[
-            "기준_명확성",
-            "결과_기간_완료",
-            "근거_일치",
-            "원출처_중복",
-            "반증_검색",
-        ],
-    )
-    def test_자기검토_필수항목이_거짓이면_yes_no를_승인하지_않는다(self, field: str):
+    def test_이관_결과는_이관_사유와_함께_반환한다(self):
         bundle = _공식_증거_번들("YES")
-        setattr(bundle.self_review, field, False)
-
-        result, _, calls = _판정_실행(_입력(), bundle, [_판정("YES")] * 4)
-
-        assert result.decision == "ESCALATED"
-        assert "자기검토" in (result.escalation_reason or "")
-        assert calls == 4
-
-    def test_자기검토에_남은_조사가_있으면_yes_no를_승인하지_않는다(self):
-        bundle = _공식_증거_번들("YES")
-        bundle.self_review.missing_research = ["기준일 확인"]
-
-        result, _, calls = _판정_실행(_입력(), bundle, [_판정("YES")] * 4)
-
-        assert result.decision == "ESCALATED"
-        assert "자기검토" in (result.escalation_reason or "")
-        assert calls == 4
-
-    def test_이관은_구체적_사유가_있으면_불완전한_자기검토를_허용한다(self):
-        bundle = _공식_증거_번들("YES")
-        bundle.self_review.criteria_clear = False
-
         result, _, calls = _판정_실행(
             _입력(),
             bundle,
-            [_판정("ESCALATED", reason="시장 기준일 해석이 모호합니다.")],
+            [_결과(bundle, "ESCALATED", reason="증거가 부족합니다.")],
         )
 
         assert result.decision == "ESCALATED"
-        assert result.escalation_reason == "시장 기준일 해석이 모호합니다."
+        assert result.escalation_reason == "증거가 부족합니다."
         assert calls == 1
 
-
-class Test증거적합성검토:
-    def test_공식_출처라도_시점이_불명확하면_자동_승인하지_않는다(self):
-        bundle = _공식_증거_번들("YES", fitness="STALE_OR_UNDATED")
-
-        result, _, calls = _판정_실행(_입력(), bundle, [_판정("YES")] * 4)
-
-        assert result.decision == "ESCALATED"
-        assert "FINAL" in (result.escalation_reason or "")
-        assert calls == 4
-
-    @pytest.mark.parametrize(
-        "fitness",
-        ["PRELIMINARY", "FORECAST"],
-        ids=["PRELIMINARY", "FORECAST"],
-    )
-    def test_확정되지_않은_자료이면_자동_승인하지_않는다(self, fitness: str):
-        bundle = _공식_증거_번들("YES", fitness=fitness)
-
-        result, _, _ = _판정_실행(_입력(), bundle, [_판정("YES")] * 4)
-
-        assert result.decision == "ESCALATED"
-
-
-class Test판정보완:
-    def test_증거가_부족하면_보완_후_증거와_함께_이관한다(self):
-        bundle = _고신뢰_증거_번들("YES", ["기관 A"])
-
-        result, _, calls = _판정_실행(
-            _입력(official_sources=[]),
-            bundle,
-            [_판정("YES")] * 4,
-        )
-
-        assert result.decision == "ESCALATED"
-        assert result.evidence
-        assert "현재 1개" in (result.escalation_reason or "")
-        assert "2개 필요" in (result.escalation_reason or "")
-        assert calls == 4
-
-    def test_같은_원출처의_재게시_두개는_독립_증거_하나로_계산한다(self):
-        bundle = _고신뢰_증거_번들("YES", ["원기관", "원기관"])
-
-        result, _, calls = _판정_실행(
-            _입력(official_sources=[]),
-            bundle,
-            [_판정("YES")] * 4,
-        )
-
-        assert result.decision == "ESCALATED"
-        assert calls == 4
-
-    def test_사유_없는_이관은_보완_후_구체적_사유를_받아들인다(self):
+    def test_결론과_다른_방향의_증거만_있으면_재시도시킨다(self):
+        bundle = _공식_증거_번들("NO")
         result, _, calls = _판정_실행(
             _입력(),
-            _공식_증거_번들("YES", fitness="PRELIMINARY"),
+            bundle,
             [
-                _판정("ESCALATED"),
-                _판정("ESCALATED", reason="잠정 집계만 확인했습니다."),
+                _결과(bundle, "YES"),
+                _결과(bundle, "ESCALATED", reason="YES 방향 증거가 없습니다."),
+            ],
+        )
+
+        assert result.decision == "ESCALATED"
+        assert calls == 2
+
+    def test_사유_없는_이관은_재시도시킨다(self):
+        bundle = _공식_증거_번들("YES")
+        result, _, calls = _판정_실행(
+            _입력(),
+            bundle,
+            [
+                _결과(bundle, "ESCALATED"),
+                _결과(bundle, "ESCALATED", reason="잠정 집계만 확인했습니다."),
             ],
         )
 
         assert result.decision == "ESCALATED"
         assert result.escalation_reason == "잠정 집계만 확인했습니다."
         assert calls == 2
-
-    def test_사유_없는_이관을_세번_보완하지_못하면_기본_사유로_이관한다(self):
-        result, _, calls = _판정_실행(
-            _입력(),
-            _공식_증거_번들("YES", fitness="PRELIMINARY"),
-            [_판정("ESCALATED")] * 4,
-        )
-
-        assert result.decision == "ESCALATED"
-        assert "이관 사유" in (result.escalation_reason or "")
-        assert calls == 4
-
-
-class Test사람검토이관:
-    def test_권위_있는_출처가_yes와_no로_충돌하면_즉시_이관한다(self):
-        result, _, calls = _판정_실행(
-            _입력(official_sources=[]),
-            _충돌_증거_번들(),
-            [_판정("YES")],
-        )
-
-        assert result.decision == "ESCALATED"
-        assert "충돌" in (result.escalation_reason or "")
-        assert calls == 1
-
-    @pytest.mark.parametrize(
-        "fitness",
-        ["STALE_OR_UNDATED", "INCONCLUSIVE", "FORECAST"],
-        ids=["낡은_자료", "확인_실패", "예상치"],
-    )
-    def test_확정되지_않은_적합성의_반대증거는_충돌로_보지_않는다(self, fitness: str):
-        bundle = _번들(
-            [
-                _증거(
-                    "NO",
-                    url="https://no.example/result",
-                    authority="official",
-                    publisher="확정 공식 기관",
-                ),
-                _증거(
-                    "YES",
-                    url="https://yes.example/stale-profile",
-                    authority="official",
-                    publisher="미확정 공식 자료",
-                ),
-            ]
-        )
-        bundle.evidence_reviews[1].fitness = EvidenceFitness(fitness)
-
-        result, _, calls = _판정_실행(
-            _입력(official_sources=[]), bundle, [_판정("NO")]
-        )
-
-        assert result.decision == "NO"
-        assert calls == 1
-
-    def test_preliminary_적합성의_반대증거와_충돌하면_이관한다(self):
-        bundle = _충돌_증거_번들()
-        bundle.evidence_reviews[1].fitness = EvidenceFitness.PRELIMINARY
-
-        result, _, calls = _판정_실행(
-            _입력(official_sources=[]), bundle, [_판정("YES")]
-        )
-
-        assert result.decision == "ESCALATED"
-        assert "충돌" in (result.escalation_reason or "")
-        assert calls == 1
 
 
 class TestResolve실행:
@@ -438,7 +259,9 @@ class TestResolve실행:
         def model_function(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
             raise AssertionError("판정 Agent를 호출하면 안 됩니다")
 
-        with _agent.override(model=FunctionModel(model_function)):
+        with _agent.override(
+            model=FunctionModel(model_function, profile=NATIVE_OUTPUT_PROFILE)
+        ):
             result = asyncio.run(resolver.resolve(_입력()))
 
         assert result.decision == "ESCALATED"
@@ -457,19 +280,43 @@ class TestResolve실행:
         monkeypatch.setattr(resolver, "investigate", 가짜조사)
         monkeypatch.setattr(resolver, "create_search_backend", lambda: sentinel)
 
-        def model_function(_messages: list[Any], info: AgentInfo) -> ModelResponse:
-            return ModelResponse(
-                parts=[ToolCallPart(info.output_tools[0].name, _판정("YES"))]
-            )
+        def model_function(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[TextPart(json.dumps(_결과(bundle, "YES")))])
 
         caplog.set_level(logging.INFO, logger=resolver.__name__)
-        with _agent.override(model=FunctionModel(model_function)):
+        with _agent.override(
+            model=FunctionModel(model_function, profile=NATIVE_OUTPUT_PROFILE)
+        ):
             result = asyncio.run(resolver.resolve(_입력()))
 
         assert result.decision == "YES"
         assert result.evidence == bundle.evidence
         assert captured_backends == [sentinel]
         assert "agent usage" in caplog.text
+
+    def test_모델이_prediction_id를_잘못_적어도_입력값으로_바로잡는다(
+        self, monkeypatch
+    ):
+        bundle = _공식_증거_번들("YES")
+
+        async def 가짜조사(_investigation, _backend):
+            return bundle
+
+        monkeypatch.setattr(resolver, "investigate", 가짜조사)
+        monkeypatch.setattr(
+            resolver, "create_search_backend", lambda: SimpleNamespace(name="fake")
+        )
+        wrong = _결과(bundle, "YES") | {"prediction_id": "prediction-999"}
+
+        def model_function(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[TextPart(json.dumps(wrong))])
+
+        with _agent.override(
+            model=FunctionModel(model_function, profile=NATIVE_OUTPUT_PROFILE)
+        ):
+            result = asyncio.run(resolver.resolve(_입력()))
+
+        assert result.prediction_id == "prediction-1"
 
     def test_인자로_받은_검색_backend를_기본_선택보다_우선한다(self, monkeypatch):
         bundle = _공식_증거_번들("YES")
@@ -488,12 +335,12 @@ class TestResolve실행:
         )
         injected = SimpleNamespace(name="injected")
 
-        def model_function(_messages: list[Any], info: AgentInfo) -> ModelResponse:
-            return ModelResponse(
-                parts=[ToolCallPart(info.output_tools[0].name, _판정("YES"))]
-            )
+        def model_function(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[TextPart(json.dumps(_결과(bundle, "YES")))])
 
-        with _agent.override(model=FunctionModel(model_function)):
+        with _agent.override(
+            model=FunctionModel(model_function, profile=NATIVE_OUTPUT_PROFILE)
+        ):
             result = asyncio.run(
                 resolver.resolve(_입력(), search_backend=injected)
             )
