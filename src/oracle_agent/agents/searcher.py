@@ -487,8 +487,9 @@ _agent = Agent(
 
 @_agent.instructions
 def _investigation_context(ctx: RunContext[SearchDeps]) -> str:
+    # resolve_after는 resolve()의 시간 게이트 전용이라 조사 컨텍스트에서 제외한다.
     investigation = ctx.deps.investigation.model_dump(
-        mode="json", exclude={"prediction_id"}
+        mode="json", exclude={"prediction_id", "resolve_after"}
     )
     return "현재 조사 입력:\n" + json.dumps(investigation, ensure_ascii=False, indent=2)
 
