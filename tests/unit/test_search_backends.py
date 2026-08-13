@@ -13,6 +13,7 @@ from oracle_agent.agents.search_backends import (
     OpenAIWebSearchBackend,
     TavilySearchBackend,
     create_search_backend,
+    fetch_exa_contents,
 )
 
 
@@ -125,6 +126,115 @@ class TestExa검색:
         assert results[0].title == "결과 A"
         assert results[0].published_at == "2026-08-01"
         assert results[1].title == "b.example"
+
+
+class TestExa본문조회:
+    def _client(self, handler) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    def test_렌더링된_본문이_있으면_url_title_content를_반환한다(self):
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["key"] = request.headers["x-api-key"]
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "url": "https://a.example/page",
+                            "title": "렌더링된 제목",
+                            "text": "렌더링된 본문",
+                        }
+                    ]
+                },
+            )
+
+        result = asyncio.run(
+            fetch_exa_contents(
+                "https://a.example/page",
+                api_key="exa-key",
+                http_client=self._client(handler),
+            )
+        )
+
+        assert captured["url"] == search_backends.EXA_CONTENTS_URL
+        assert captured["key"] == "exa-key"
+        assert captured["body"] == {
+            "urls": ["https://a.example/page"],
+            "text": True,
+            "livecrawl": "always",
+            "livecrawlTimeout": 10_000,
+        }
+        assert result == {
+            "url": "https://a.example/page",
+            "title": "렌더링된 제목",
+            "content": "렌더링된 본문",
+        }
+
+    def test_본문이_최대_길이를_넘으면_잘라서_반환한다(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"results": [{"url": "https://a.example/page", "text": "가나다라마"}]},
+            )
+
+        result = asyncio.run(
+            fetch_exa_contents(
+                "https://a.example/page",
+                api_key="exa-key",
+                http_client=self._client(handler),
+                max_content_length=3,
+            )
+        )
+
+        assert result is not None
+        assert result["content"] == "가나다"
+
+    def test_api_key가_없으면_none을_반환한다(self, monkeypatch):
+        monkeypatch.delenv("EXA_API_KEY", raising=False)
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            return httpx.Response(200, json={"results": []})
+
+        result = asyncio.run(
+            fetch_exa_contents("https://a.example/page", http_client=self._client(handler))
+        )
+
+        assert result is None
+        assert calls == []
+
+    def test_결과가_비어_있으면_none을_반환한다(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"results": []})
+
+        result = asyncio.run(
+            fetch_exa_contents(
+                "https://a.example/page",
+                api_key="exa-key",
+                http_client=self._client(handler),
+            )
+        )
+
+        assert result is None
+
+    def test_http_오류이면_none을_반환한다(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"error": "server"})
+
+        result = asyncio.run(
+            fetch_exa_contents(
+                "https://a.example/page",
+                api_key="exa-key",
+                http_client=self._client(handler),
+            )
+        )
+
+        assert result is None
 
 
 class TestTavily검색:

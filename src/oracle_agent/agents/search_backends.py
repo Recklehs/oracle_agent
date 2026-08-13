@@ -23,6 +23,7 @@ DEFAULT_OPENAI_SEARCH_MODEL = "gpt-5.6-luna"
 DEFAULT_GEMINI_SEARCH_MODEL = "gemini-3.5-flash-lite"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 EXA_SEARCH_URL = "https://api.exa.ai/search"
+EXA_CONTENTS_URL = "https://api.exa.ai/contents"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 logger = logging.getLogger(__name__)
@@ -239,6 +240,55 @@ class ExaSearchBackend:
                 for item in response.json().get("results") or []
             ]
         )
+
+
+async def fetch_exa_contents(
+    url: str,
+    *,
+    api_key: str | None = None,
+    http_client: httpx.AsyncClient | None = None,
+    max_content_length: int = 50_000,
+) -> dict[str, str] | None:
+    """Exa /contents로 JS 렌더링된 페이지 본문을 조회한다.
+
+    EXA_API_KEY가 없거나 조회에 실패하면 None을 반환해 호출측이 기존 경로를 유지한다.
+    """
+    key = api_key or os.environ.get("EXA_API_KEY")
+    if not key:
+        return None
+    body = {
+        "urls": [url],
+        "text": True,
+        # 날짜에 민감한 판정에 오래된 캐시 본문이 섞이지 않게 항상 새로 크롤링한다.
+        "livecrawl": "always",
+        "livecrawlTimeout": 10_000,
+    }
+    client = http_client or retrying_async_client()
+    try:
+        response = await client.post(
+            EXA_CONTENTS_URL,
+            headers={"x-api-key": key},
+            json=body,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as error:
+        logger.warning("exa contents 조회 실패 url=%s error=%s", url, error)
+        return None
+    finally:
+        if http_client is None:
+            await client.aclose()
+    results = response.json().get("results") or []
+    item = results[0] if results else {}
+    text = item.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    hostname = urlsplit(url).hostname or url
+    title = item.get("title")
+    return {
+        "url": item.get("url") or url,
+        "title": title if isinstance(title, str) and title.strip() else hostname,
+        "content": text[:max_content_length],
+    }
 
 
 class TavilySearchBackend:
