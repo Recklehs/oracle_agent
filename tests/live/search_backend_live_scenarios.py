@@ -76,6 +76,18 @@ OFFICIAL_DOMAIN = _Scenario(
     query="December 2024 FOMC statement federal funds rate target range",
     target_domains=("federalreserve.gov",),
 )
+PARTY_RACE_KOREAN = _Scenario(
+    label="당대표 경선 시사 검색",
+    query="더불어민주당 당대표 인천 지역 결과 김민석 후보 1위",
+)
+EMPLOYMENT_ENGLISH = _Scenario(
+    label="인물 재직 여부 검색",
+    query="Is Jeff Dean still working at Google as of August 12, 2026?",
+)
+APPROVAL_RATING_KOREAN = _Scenario(
+    label="대통령 지지율 여론조사 검색",
+    query="이재명 대통령 지지율 여론조사 2026년 8월 12일",
+)
 
 _records: list[dict[str, Any]] = []
 _pause_before_next_search = False
@@ -170,6 +182,18 @@ class Test검색backend라이브검증:
             for result in results
         )
 
+    def test_당대표_경선_검색어로_후보_url을_반환한다(self, backend: SearchBackend):
+        results = _run_search(backend, PARTY_RACE_KOREAN)
+        assert results
+
+    def test_인물_재직_여부_검색어로_후보_url을_반환한다(self, backend: SearchBackend):
+        results = _run_search(backend, EMPLOYMENT_ENGLISH)
+        assert results
+
+    def test_지지율_여론조사_검색어로_후보_url을_반환한다(self, backend: SearchBackend):
+        results = _run_search(backend, APPROVAL_RATING_KOREAN)
+        assert results
+
 
 def _write_report() -> None:
     if not _records:
@@ -186,7 +210,14 @@ def _write_report() -> None:
         f"- 실행 시각: {now:%Y-%m-%d %H:%M:%S %Z}",
         f"- 키가 없어 건너뛴 backend: {', '.join(missing) if missing else '없음'}",
     ]
-    for scenario in (GENERAL_ENGLISH, GENERAL_KOREAN, OFFICIAL_DOMAIN):
+    for scenario in (
+        GENERAL_ENGLISH,
+        GENERAL_KOREAN,
+        OFFICIAL_DOMAIN,
+        PARTY_RACE_KOREAN,
+        EMPLOYMENT_ENGLISH,
+        APPROVAL_RATING_KOREAN,
+    ):
         rows = [record for record in _records if record["scenario"] == scenario]
         if not rows:
             continue
