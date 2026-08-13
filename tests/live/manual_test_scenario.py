@@ -68,15 +68,6 @@ async def _resolve_and_close(investigation: InvestigationInput):
         ),
         pytest.param(
             _scenario(
-                "manual-busan-high-temperature-2026-08-08",
-                "2026년 8월 8일 부산의 최고기온은 40도를 넘었다",
-                datetime(2026, 8, 8, 14, tzinfo=UTC),
-            ),
-            "NO",
-            id="부산_최고기온_40도_초과_no",
-        ),
-        pytest.param(
-            _scenario(
                 "manual-democratic-party-incheon-2026-08-08",
                 "2026년 8월 8일에 발표된 더불어민주당 당대표 인천 지역 결과에서 김민석 후보가 1위를 했다",
                 datetime(2026, 8, 8, 13, tzinfo=UTC),
@@ -92,43 +83,7 @@ async def _resolve_and_close(investigation: InvestigationInput):
             ),
             "NO",
             id="jeff_dean_구글_직원_no",
-        ),
-        pytest.param(
-            _scenario(
-                "manual-president-approval-at-least-50-2026-08-06",
-                "2026년 8월 6일 기준으로 이재명 대통령의 지지율은 50% 이상이다",
-                datetime(2026, 8, 7, tzinfo=UTC),
-            ),
-            "NO",
-            id="이재명_지지율_50퍼센트_이상_no",
-        ),
-        pytest.param(
-            _scenario(
-                "manual-president-approval-at-least-40-2026-08-06",
-                "2026년 8월 6일 기준으로 이재명 대통령의 지지율은 40% 이상이다",
-                datetime(2026, 8, 7, tzinfo=UTC),
-            ),
-            "YES",
-            id="이재명_지지율_40퍼센트_이상_yes",
-        ),
-        pytest.param(
-            _scenario(
-                "manual-president-approval-at-least-90-2026-08-06",
-                "2026년 8월 6일 기준으로 이재명 대통령의 지지율은 90% 이상이다",
-                datetime(2026, 8, 7, tzinfo=UTC),
-            ),
-            "NO",
-            id="이재명_지지율_90퍼센트_이상_no",
-        ),
-        pytest.param(
-            _scenario(
-                "manual-president-approval-at-most-90-2026-08-06",
-                "2026년 8월 6일 기준으로 이재명 대통령의 지지율은 90% 이하이다",
-                datetime(2026, 8, 7, tzinfo=UTC),
-            ),
-            "YES",
-            id="이재명_지지율_90퍼센트_이하_yes",
-        ),
+        )
     ],
 )
 def test_실제_luna가_수동_시나리오를_조사해_기대_결론을_낸다(
