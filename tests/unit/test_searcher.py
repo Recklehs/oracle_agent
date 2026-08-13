@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from typing import Any, Literal
 
 import pytest
-from pydantic_ai import ModelRetry, UnexpectedModelBehavior, models
+from pydantic_ai import BinaryContent, ModelRetry, UnexpectedModelBehavior, models
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -13,7 +13,6 @@ from oracle_agent.agents import searcher
 from oracle_agent.agents.search_backends import SearchResult
 from oracle_agent.agents.searcher import (
     EvidenceBundle,
-    SearchCategory,
     SearchDeps,
     SearchTrace,
     normalize_url,
@@ -24,6 +23,19 @@ from oracle_agent.models import InvestigationInput
 models.ALLOW_MODEL_REQUESTS = False
 
 Direction = Literal["YES", "NO"]
+
+
+@pytest.fixture(autouse=True)
+def exa_contents_차단(monkeypatch) -> list[str]:
+    """단위 테스트가 실제 exa contents API를 호출하지 않게 기본 fallback을 무효화한다."""
+    calls: list[str] = []
+
+    async def fake_fetch(url: str, **_kwargs) -> None:
+        calls.append(url)
+        return None
+
+    monkeypatch.setattr(searcher, "fetch_exa_contents", fake_fetch)
+    return calls
 
 
 class _가짜백엔드:
@@ -75,17 +87,14 @@ def _증거(
 
 def _검색_계획() -> list[dict[str, object]]:
     return [
-        {"category": "OFFICIAL", "query": "사건 공식 결과", "target_domains": ["example.com"]},
-        {"category": "CURRENT", "query": "사건 기준일 최신 상태", "target_domains": []},
-        {"category": "SUPPORTS_YES", "query": "사건 발생 확인", "target_domains": []},
-        {"category": "SUPPORTS_NO", "query": "사건 미발생 반증", "target_domains": []},
+        {"query": "사건 공식 결과", "target_domains": ["example.com"]},
     ]
 
 
 def _검색_후보들(
     count: int,
     *,
-    discovered_by: str = "OFFICIAL",
+    discovered_by: str = "SEARCH",
 ) -> list[dict[str, str]]:
     return [
         {
@@ -251,21 +260,31 @@ class Test조사출력경계:
 
 
 class Test검색계획검토:
-    def test_필수_검색_범주가_빠지면_보완_조사한다(self):
+    def test_검색어를_하나도_제출하지_않으면_보완_조사한다(self):
         output = _공식_증거_조사출력("YES")
-        output["search_queries"] = output["search_queries"][:-1]
+        output["search_queries"] = []
 
         bundle, _, calls = _조사_실행(_입력(), [output, _공식_증거_조사출력("YES")])
 
         assert bundle.gate_failure is None
         assert calls == 2
 
-    def test_같은_검색어를_네_범주에_복사하면_보완_조사한다(self):
+    def test_같은_검색어를_중복_제출하면_보완_조사한다(self):
         invalid = _공식_증거_조사출력("YES")
-        for query in invalid["search_queries"]:
-            query["query"] = "사건 결과"
+        invalid["search_queries"] = invalid["search_queries"] * 2
 
         bundle, _, calls = _조사_실행(_입력(), [invalid, _공식_증거_조사출력("YES")])
+
+        assert bundle.gate_failure is None
+        assert calls == 2
+
+    def test_실행한_검색어를_기록에서_빠뜨리면_보완_조사한다(self):
+        incomplete = _공식_증거_조사출력("YES")
+        complete = _공식_증거_조사출력("YES")
+        complete["search_queries"].append({"query": "사건 재검색", "target_domains": []})
+        trace = _기록(complete, official_sources=["https://example.com/official/"])
+
+        bundle, _, calls = _조사_실행(_입력(), [incomplete, complete], trace=trace)
 
         assert bundle.gate_failure is None
         assert calls == 2
@@ -274,8 +293,30 @@ class Test검색계획검토:
 class Test조사지시문:
     @pytest.mark.parametrize(
         "required",
-        ["OFFICIAL", "CURRENT", "SUPPORTS_YES", "SUPPORTS_NO", "원문", "최대 5개", "FINAL"],
-        ids=["OFFICIAL", "CURRENT", "SUPPORTS_YES", "SUPPORTS_NO", "원문", "최대_5개", "FINAL"],
+        [
+            "검색어 1개",
+            "재검색",
+            "글자 그대로",
+            "원문",
+            "최대 5개",
+            "FINAL",
+            "thin_content",
+            "query",
+            "render",
+            "supports",
+        ],
+        ids=[
+            "검색어_1개",
+            "재검색",
+            "글자_그대로",
+            "원문",
+            "최대_5개",
+            "FINAL",
+            "thin_content",
+            "query_변형",
+            "render",
+            "supports_방향",
+        ],
     )
     def test_조사지시문에_필수_검색과_원문검증_규칙이_있다(self, required: str):
         assert required in searcher.SEARCH_INSTRUCTIONS
@@ -469,6 +510,89 @@ class Test조사실행기록:
         assert bundle.gate_failure is None
         assert calls == 2
 
+    def test_검색_결과와_query만_다른_후보는_gate를_통과한다(self):
+        variant_url = "https://portal.example/data?stn=159&date=2026-08-08"
+        output = _조사출력(
+            [
+                _증거(
+                    "YES",
+                    url=variant_url,
+                    authority="official",
+                    publisher="공식 기관",
+                )
+            ]
+        )
+        trace = SearchTrace(
+            queries={query["query"].casefold() for query in _검색_계획()},
+            source_urls={normalize_url("https://portal.example/data")},
+            attempted_fetch_urls={normalize_url(variant_url)},
+            fetched_urls={normalize_url(variant_url)},
+        )
+
+        bundle, _, calls = _조사_실행(
+            _입력(official_sources=[]), [output], trace=trace
+        )
+
+        assert bundle.gate_failure is None
+        assert calls == 1
+
+    def test_같은_페이지의_변형을_여럿_조회하고_대표만_제출해도_통과한다(self):
+        variant_url = "https://portal.example/data?stn=159&date=2026-08-08"
+        output = _조사출력(
+            [
+                _증거(
+                    "YES",
+                    url=variant_url,
+                    authority="official",
+                    publisher="공식 기관",
+                )
+            ]
+        )
+        fetched = {
+            normalize_url("https://portal.example/data"),
+            normalize_url("https://portal.example/data?stn=108"),
+            normalize_url(variant_url),
+        }
+        trace = SearchTrace(
+            queries={query["query"].casefold() for query in _검색_계획()},
+            source_urls={normalize_url("https://portal.example/data")},
+            attempted_fetch_urls=set(fetched),
+            fetched_urls=set(fetched),
+        )
+
+        bundle, _, calls = _조사_실행(
+            _입력(official_sources=[]), [output], trace=trace
+        )
+
+        assert bundle.gate_failure is None
+        assert calls == 1
+
+    def test_조회한_페이지를_후보로_기록하지_않으면_보완_조사한다(self):
+        output = _공식_증거_조사출력("YES")
+        trace = _기록(
+            output,
+            official_sources=["https://example.com/official/"],
+            extra_fetched_urls=["https://hidden.example/page"],
+        )
+
+        bundle, _, calls = _조사_실행(_입력(), [output] * 4, trace=trace)
+
+        assert bundle.gate_failure is not None
+        assert "후보" in bundle.gate_failure
+        assert calls == 4
+
+    def test_검색_결과와_path가_다른_후보는_보완_조사한다(self):
+        undiscovered = _공식_증거_조사출력("YES")
+        undiscovered["search_candidates"][0]["url"] = "https://example.com/other?x=1"
+
+        bundle, _, calls = _조사_실행(
+            _입력(),
+            [undiscovered, _공식_증거_조사출력("YES")],
+        )
+
+        assert bundle.gate_failure is None
+        assert calls == 2
+
     def test_원문을_조회하지_않은_evidence이면_실패한다(self):
         output = _공식_증거_조사출력("YES")
         trace = SearchTrace(
@@ -599,7 +723,6 @@ class Test검색도구:
         results = asyncio.run(
             searcher._search_web(
                 ctx,
-                SearchCategory.OFFICIAL,
                 "사건 공식 결과",
                 ["example.com"],
             )
@@ -609,6 +732,173 @@ class Test검색도구:
         assert backend.calls == [("사건 공식 결과", ("example.com",))]
         assert "사건 공식 결과" in deps.trace.queries
         assert normalize_url("https://found.example/result") in deps.trace.source_urls
+
+
+class Test동적페이지fallback:
+    def _조회(self, official_url: str) -> tuple[SearchDeps, Any]:
+        deps = SearchDeps(
+            investigation=_입력(official_sources=[official_url]),
+            backend=_가짜백엔드(),
+        )
+        return deps, SimpleNamespace(deps=deps)
+
+    def test_직접_조회_본문이_짧으면_exa_contents_본문으로_대체한다(self, monkeypatch):
+        url = "https://spa.example/page"
+
+        async def thin_fetch(_url: str):
+            return {"url": url, "title": "제목", "content": 'window["fp"]=false'}
+
+        async def rendered(fetch_url: str, **_kwargs):
+            return {"url": fetch_url, "title": "렌더링 제목", "content": "본" * 600}
+
+        monkeypatch.setattr(searcher._raw_web_fetch_tool, "function", thin_fetch)
+        monkeypatch.setattr(searcher, "fetch_exa_contents", rendered)
+        deps, ctx = self._조회(url)
+
+        result = asyncio.run(searcher._fetch_web_page(ctx, url))
+
+        assert result["fetched_via"] == "exa_contents"
+        assert result["content"] == "본" * 600
+        assert normalize_url(url) in deps.trace.fetched_urls
+
+    def test_본문이_충분하면_exa_contents를_호출하지_않는다(
+        self, monkeypatch, exa_contents_차단
+    ):
+        url = "https://static.example/page"
+
+        async def full_fetch(_url: str):
+            return {"url": url, "title": "제목", "content": "가" * 600}
+
+        monkeypatch.setattr(searcher._raw_web_fetch_tool, "function", full_fetch)
+        deps, ctx = self._조회(url)
+
+        result = asyncio.run(searcher._fetch_web_page(ctx, url))
+
+        assert "fetched_via" not in result
+        assert "thin_content" not in result
+        assert exa_contents_차단 == []
+        assert normalize_url(url) in deps.trace.fetched_urls
+
+    def test_직접_조회가_세번_실패해도_exa_contents가_성공하면_본문으로_회복한다(
+        self, monkeypatch
+    ):
+        url = "https://blocked.example/page"
+
+        async def always_fails(_url: str):
+            raise ModelRetry("페이지에 접근할 수 없습니다")
+
+        async def rendered(fetch_url: str, **_kwargs):
+            return {"url": fetch_url, "title": "렌더링 제목", "content": "본" * 600}
+
+        monkeypatch.setattr(searcher._raw_web_fetch_tool, "function", always_fails)
+        monkeypatch.setattr(searcher, "fetch_exa_contents", rendered)
+        deps, ctx = self._조회(url)
+
+        result = asyncio.run(searcher._fetch_web_page(ctx, url))
+
+        assert result["fetched_via"] == "exa_contents"
+        assert normalize_url(url) in deps.trace.fetched_urls
+        assert deps.trace.failed_fetch_urls == set()
+
+    def test_exa_contents도_본문이_짧으면_thin_content를_표시해_반환한다(
+        self, monkeypatch
+    ):
+        url = "https://spa.example/page"
+
+        async def thin_fetch(_url: str):
+            return {"url": url, "title": "제목", "content": 'window["fp"]=false'}
+
+        async def thin_rendered(fetch_url: str, **_kwargs):
+            return {"url": fetch_url, "title": "렌더링 제목", "content": "짧음"}
+
+        monkeypatch.setattr(searcher._raw_web_fetch_tool, "function", thin_fetch)
+        monkeypatch.setattr(searcher, "fetch_exa_contents", thin_rendered)
+        deps, ctx = self._조회(url)
+
+        result = asyncio.run(searcher._fetch_web_page(ctx, url))
+
+        assert result["content"] == 'window["fp"]=false'
+        assert "미만" in result["thin_content"]
+        assert normalize_url(url) in deps.trace.fetched_urls
+
+    def test_exa_key가_없으면_fallback_없이_thin_content만_표시한다(self, monkeypatch):
+        url = "https://spa.example/page"
+
+        async def thin_fetch(_url: str):
+            return {"url": url, "title": "제목", "content": 'window["fp"]=false'}
+
+        monkeypatch.setattr(searcher._raw_web_fetch_tool, "function", thin_fetch)
+        deps, ctx = self._조회(url)
+
+        result = asyncio.run(searcher._fetch_web_page(ctx, url))
+
+        assert "fetched_via" not in result
+        assert "미만" in result["thin_content"]
+        assert normalize_url(url) in deps.trace.fetched_urls
+
+    def test_직접_조회와_fallback이_모두_실패하면_error를_반환한다(self, monkeypatch):
+        url = "https://unavailable.example/page"
+
+        async def always_fails(_url: str):
+            raise ModelRetry("페이지에 접근할 수 없습니다")
+
+        monkeypatch.setattr(searcher._raw_web_fetch_tool, "function", always_fails)
+        deps, ctx = self._조회(url)
+
+        result = asyncio.run(searcher._fetch_web_page(ctx, url))
+
+        assert "접근할 수 없습니다" in result["error"]
+        assert normalize_url(url) in deps.trace.failed_fetch_urls
+
+    def test_render를_지정하면_직접_조회_없이_exa_contents_본문으로_조회한다(
+        self, monkeypatch
+    ):
+        url = "https://spa.example/page"
+        raw_calls: list[str] = []
+
+        async def raw_fetch(fetch_url: str):
+            raw_calls.append(fetch_url)
+            return {"url": url, "title": "제목", "content": "가" * 600}
+
+        async def rendered(fetch_url: str, **_kwargs):
+            return {"url": fetch_url, "title": "렌더링 제목", "content": "본" * 600}
+
+        monkeypatch.setattr(searcher._raw_web_fetch_tool, "function", raw_fetch)
+        monkeypatch.setattr(searcher, "fetch_exa_contents", rendered)
+        deps, ctx = self._조회(url)
+
+        result = asyncio.run(searcher._fetch_web_page(ctx, url, render=True))
+
+        assert result["fetched_via"] == "exa_contents"
+        assert raw_calls == []
+        assert normalize_url(url) in deps.trace.fetched_urls
+
+    def test_render_조회가_실패하면_error를_반환한다(self):
+        url = "https://spa.example/page"
+        deps, ctx = self._조회(url)
+
+        result = asyncio.run(searcher._fetch_web_page(ctx, url, render=True))
+
+        assert "렌더링" in result["error"]
+        assert normalize_url(url) in deps.trace.failed_fetch_urls
+
+    def test_pdf_같은_binary_응답은_thin_판정_없이_그대로_반환한다(
+        self, monkeypatch, exa_contents_차단
+    ):
+        url = "https://files.example/report.pdf"
+        binary = BinaryContent(data=b"%PDF-1.7", media_type="application/pdf")
+
+        async def binary_fetch(_url: str):
+            return binary
+
+        monkeypatch.setattr(searcher._raw_web_fetch_tool, "function", binary_fetch)
+        deps, ctx = self._조회(url)
+
+        result = asyncio.run(searcher._fetch_web_page(ctx, url))
+
+        assert result is binary
+        assert exa_contents_차단 == []
+        assert normalize_url(url) in deps.trace.fetched_urls
 
 
 class Test웹조회실패:
@@ -699,6 +989,68 @@ class Test검색후보조회차단:
         assert refusal is not None
         assert "최대 5개" in refusal
 
+    def test_검색_결과_url과_query만_다른_주소는_조회를_허용한다(self):
+        deps = SearchDeps(
+            investigation=_입력(official_sources=[]),
+            backend=_가짜백엔드(),
+        )
+        deps.trace.source_urls.add(normalize_url("https://portal.example/data"))
+
+        refusal = searcher._search_fetch_refusal(
+            deps, "https://portal.example/data?stn=159&date=2026-08-08"
+        )
+
+        assert refusal is None
+
+    def test_공식_url의_query_변형도_새_페이지면_예산에_포함한다(self):
+        deps = SearchDeps(
+            investigation=_입력(official_sources=["https://official.example/data"]),
+            backend=_가짜백엔드(),
+        )
+        for index in range(5):
+            deps.trace.attempted_fetch_urls.add(
+                normalize_url(f"https://candidate-{index}.example/result")
+            )
+
+        refusal = searcher._search_fetch_refusal(
+            deps, "https://official.example/data?stn=1"
+        )
+
+        assert refusal is not None
+        assert "최대 5개" in refusal
+
+    def test_path가_다른_주소는_같은_host여도_거절한다(self):
+        deps = SearchDeps(
+            investigation=_입력(official_sources=[]),
+            backend=_가짜백엔드(),
+        )
+        deps.trace.source_urls.add(normalize_url("https://portal.example/data"))
+
+        refusal = searcher._search_fetch_refusal(
+            deps, "https://portal.example/other?stn=159"
+        )
+
+        assert refusal is not None
+        assert "검색 결과" in refusal
+
+    def test_query_변형은_같은_페이지라서_예산을_추가로_쓰지_않는다(self):
+        deps = SearchDeps(
+            investigation=_입력(official_sources=[]),
+            backend=_가짜백엔드(),
+        )
+        deps.trace.source_urls.add(normalize_url("https://portal.example/data"))
+        deps.trace.attempted_fetch_urls.add(normalize_url("https://portal.example/data"))
+        for index in range(4):
+            url = f"https://candidate-{index}.example/result"
+            deps.trace.source_urls.add(normalize_url(url))
+            deps.trace.attempted_fetch_urls.add(normalize_url(url))
+
+        refusal = searcher._search_fetch_refusal(
+            deps, "https://portal.example/data?stn=159"
+        )
+
+        assert refusal is None
+
     def test_이미_시도한_검색_후보는_응답_전에도_다시_조회를_허용한다(self):
         deps = SearchDeps(
             investigation=_입력(official_sources=[]),
@@ -717,7 +1069,7 @@ class Test검색후보조회차단:
 
 
 class Test조사실행:
-    def test_중복을_제외한_공식_url이_여섯개이면_도구호출한도를_스물셋으로_늘린다(
+    def test_중복을_제외한_공식_url이_여섯개이면_도구호출한도를_스물둘로_늘린다(
         self,
         monkeypatch,
     ):
@@ -745,7 +1097,7 @@ class Test조사실행:
         )
 
         assert captured_limits is not None
-        assert captured_limits.tool_calls_limit == 23
+        assert captured_limits.tool_calls_limit == 22
 
     def test_조사기록없이_출력하면_통과시키지_않고_사용량을_기록한다(self, caplog):
         calls = 0
